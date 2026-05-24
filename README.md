@@ -96,6 +96,31 @@ sudo systemctl enable cs2-observer
 
 ---
 
+## 🌐 API REST & Tableau de Bord en temps réel
+
+Le projet inclut une API REST (FastAPI) pour exposer les données et un Dashboard HTML local pour visualiser le flux de sniping en direct.
+
+### 1. Activer le Pare-feu de la VM (Port 8000)
+Pour que votre navigateur local puisse se connecter à l'API sur la VM, ouvrez le port 8000 en SSH :
+```bash
+sudo ufw allow 8000/tcp
+```
+*Note : N'oubliez pas d'ouvrir également le port 8000 (TCP) dans les règles d'accès d'Oracle Cloud (Security List).*
+
+### 2. Démarrer l'API sur le Serveur
+Lancez l'API dans votre environnement virtuel :
+```bash
+# Dans le dossier /home/ubuntu/cs2-observation-bot
+source venv/bin/activate
+python3 api_main.py
+```
+
+### 3. Ouvrir le Dashboard en local
+* Double-cliquez sur le fichier `dashboard.html` situé à la racine du projet sur votre ordinateur local.
+* Renseignez l'IP publique de votre serveur Oracle (`http://<IP_PUBLIQUE>:8000`) et cliquez sur **Connexion**.
+
+---
+
 ## 📊 Récupération des Données (Dataset)
 
 * **Base de données SQLite** : Située par défaut dans `/home/ubuntu/cs2-observation-bot/data/observer_dataset.db`. Elle contient les tables `transactions` (historique des ventes validées) et `observed_listings`.
@@ -105,3 +130,4 @@ Pour extraire le dataset de votre serveur vers votre machine locale :
 ```bash
 scp -i /path/to/key.key ubuntu@<IP_PUBLIQUE_ORACLE>:/home/ubuntu/cs2-observation-bot/data/observer_dataset.db ./observer_dataset.db
 ```
+
