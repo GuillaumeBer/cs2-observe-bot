@@ -1,0 +1,17 @@
+[Unit]
+Description=CS2 Observation Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/cs2-observation-bot
+ExecStart=/home/ubuntu/cs2-observation-bot/venv/bin/python observer_main.py --platform all
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cs2-observer
+
+[Install]
+WantedBy=multi-user.target
