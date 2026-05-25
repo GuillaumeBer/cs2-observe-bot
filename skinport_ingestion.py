@@ -1,5 +1,5 @@
 """
-Skinport Ingestion — WebSocket saleFeed (Socket.IO + msgpack)
+Skinport Ingestion — WebSocket brut (Socket.IO EIO4 / JSON, sans python-socketio)
 
 Architecture TTD :
   - Événement "listed"  → save_observed_listing() en DB + cache mémoire
@@ -7,35 +7,29 @@ Architecture TTD :
 
 Le WebSocket public ne nécessite PAS de clé API pour l'observation.
 Activation : mettre SKINPORT_ENABLED = True dans config.py
-
-Dépendances à ajouter dans requirements.txt :
-  python-socketio[asyncio_client]>=5.0
-  msgpack>=1.0
 """
 
 import asyncio
+import json
 import logging
 import time
 from typing import Callable, Optional, Any
 from datetime import datetime, timezone
-import socketio
+import websockets
 import config
 
 logger = logging.getLogger("cs2_sniper.skinport_ingestion")
 
-# URL Socket.IO Skinport
-_SKINPORT_WS_URL = "https://skinport.com"
-_SOCKETIO_PATH = "/socket.io"
+_WS_URL = "wss://skinport.com/socket.io/?EIO=4&transport=websocket"
 
 
 class SkinportIngestor:
     """
-    Écoute le flux temps réel Skinport (saleFeed) pour détecter
-    les listings et les ventes avec leur timestamp exact.
+    Écoute le flux temps réel Skinport (saleFeed) via WebSocket Socket.IO brut.
 
     Callbacks :
-      on_listed(normalized_dict) — appelé quand un item est mis en vente
-      on_sold(normalized_dict)   — appelé quand un item est vendu (HIGH confidence)
+      on_listed(normalized_dict) — item mis en vente
+      on_sold(normalized_dict)   — item vendu (HIGH confidence, événement confirmé)
     """
 
     def __init__(
@@ -46,22 +40,20 @@ class SkinportIngestor:
         self.on_listed = on_listed
         self.on_sold = on_sold
         self.is_running = False
-        self._sio: Optional[socketio.AsyncClient] = None
+        self._ws = None
         self._loop_task: Optional[asyncio.Task] = None
 
     async def start(self, session=None):
-        """Démarre la connexion WebSocket en tâche de fond."""
         self.is_running = True
-        self._loop_task = asyncio.create_task(self._run())
+        self._loop_task = asyncio.create_task(self._run_websocket())
 
     async def stop(self):
-        """Arrête proprement la connexion."""
         self.is_running = False
-        if self._sio and self._sio.connected:
+        if self._ws:
             try:
-                await self._sio.disconnect()
-            except Exception as e:
-                logger.debug(f"Skinport disconnect error: {e}")
+                await self._ws.close()
+            except Exception:
+                pass
         if self._loop_task:
             self._loop_task.cancel()
             try:
@@ -70,66 +62,113 @@ class SkinportIngestor:
                 pass
         logger.info("Skinport Ingestion stopped.")
 
-    async def _run(self):
-        """Boucle principale avec reconnexion automatique."""
+    async def _run_websocket(self):
+        retry_delay = 5
+
         while self.is_running:
             try:
-                await self._connect_and_listen()
+                async with websockets.connect(
+                    _WS_URL,
+                    ping_interval=None,
+                    max_size=10 * 1024 * 1024,
+                    open_timeout=15,
+                ) as ws:
+                    self._ws = ws
+                    logger.info("Skinport WebSocket connecté.")
+                    retry_delay = 5
+
+                    # EIO handshake : recevoir le paquet "0{...}" avec sid/pingInterval
+                    raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                    ping_interval = 25.0
+                    if isinstance(raw, str) and raw.startswith("0"):
+                        try:
+                            hs = json.loads(raw[1:])
+                            ping_interval = hs.get("pingInterval", 25000) / 1000
+                            logger.info(f"Skinport EIO: pingInterval={ping_interval}s")
+                        except Exception:
+                            pass
+
+                    # Socket.IO namespace connect
+                    await ws.send("40")
+
+                    # Attendre l'ACK de connexion "40{...}"
+                    while True:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                        if isinstance(raw, str) and raw == "2":
+                            await ws.send("3")
+                            continue
+                        if isinstance(raw, str) and raw.startswith("40"):
+                            break
+
+                    # S'abonner au flux saleFeed CS2
+                    await ws.send('42["saleFeedJoin",{"appid":730,"currency":"EUR","locale":"en"}]')
+                    logger.info("Skinport: abonné au saleFeed CS2.")
+
+                    last_ping = time.time()
+
+                    while self.is_running:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                            await self._handle_message(ws, raw)
+                        except asyncio.TimeoutError:
+                            pass
+
+                        # EIO ping keepalive
+                        if time.time() - last_ping >= ping_interval - 2:
+                            await ws.send("2")
+                            last_ping = time.time()
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Skinport WebSocket error: {e}")
+                logger.error(f"Skinport WebSocket erreur: {e} — reconnexion dans {retry_delay}s")
                 if self.is_running:
-                    logger.info("Skinport: reconnexion dans 30s...")
-                    await asyncio.sleep(30)
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 60)
 
-    async def _connect_and_listen(self):
-        """Établit la connexion Socket.IO et écoute les événements."""
-        self._sio = socketio.AsyncClient(
-            logger=False,
-            engineio_logger=False,
-            serializer="msgpack",       # Skinport utilise socket.io-msgpack-parser
-            reconnection=False,         # On gère la reconnexion nous-mêmes
-        )
+    async def _handle_message(self, ws, raw: Any):
+        if isinstance(raw, bytes):
+            # Skinport peut envoyer des frames binaires (msgpack) — on les ignore
+            # si on ne peut pas les parser sans msgpack
+            try:
+                import msgpack
+                data = msgpack.unpackb(raw[1:], raw=False)  # skip EIO prefix byte
+                await self._dispatch(data)
+            except Exception:
+                logger.debug(f"Skinport: frame binaire ignorée ({len(raw)} bytes)")
+            return
 
-        @self._sio.event
-        async def connect():
-            logger.info("Skinport WebSocket connecté.")
-            # S'abonner au flux de ventes (app 730 = CS2, devise EUR)
-            await self._sio.emit("saleFeedJoin", {
-                "appid": 730,
-                "currency": "EUR",
-                "locale": "en",
-            })
-            logger.info("Skinport: abonné au saleFeed CS2.")
+        if not isinstance(raw, str):
+            return
+        if raw == "2":          # EIO ping
+            await ws.send("3")
+            return
+        if raw == "3":          # EIO pong
+            return
+        if not raw.startswith("42"):
+            return
 
-        @self._sio.event
-        async def disconnect():
-            logger.warning("Skinport WebSocket déconnecté.")
+        # Socket.IO event : "42[\"eventName\", payload]"
+        try:
+            payload = json.loads(raw[2:])
+        except Exception:
+            return
 
-        @self._sio.event
-        async def connect_error(data):
-            logger.error(f"Skinport WebSocket erreur de connexion: {data}")
+        if not isinstance(payload, list) or len(payload) < 2:
+            return
 
-        @self._sio.on("saleFeed")
-        async def on_sale_feed(data):
-            if self.is_running:
-                await self._handle_sale_feed(data)
+        event_name = payload[0]
+        data = payload[1]
 
-        await self._sio.connect(
-            _SKINPORT_WS_URL,
-            transports=["websocket"],
-            socketio_path=_SOCKETIO_PATH,
-        )
-        await self._sio.wait()
+        if event_name == "saleFeed":
+            await self._dispatch(data)
 
-    async def _handle_sale_feed(self, data: Any):
-        """Dispatche les événements listed/sold."""
+    async def _dispatch(self, data: Any):
         if not isinstance(data, dict):
             return
 
         event_type = data.get("eventType") or data.get("type", "")
-        sales = data.get("sales") or data.get("items", [])
+        sales = data.get("sales") or data.get("items") or []
 
         if isinstance(sales, dict):
             sales = [sales]
@@ -146,23 +185,9 @@ class SkinportIngestor:
                 elif event_type == "sold":
                     self.on_sold(normalized)
             except Exception as e:
-                logger.error(f"Skinport: erreur traitement événement {event_type}: {e}")
+                logger.error(f"Skinport: erreur traitement {event_type}: {e}")
 
     def _normalize(self, sale: dict) -> Optional[dict]:
-        """
-        Normalise un objet SaleFeedSale Skinport vers le format interne du bot.
-
-        Champs Skinport connus :
-          id_ / sale_id / short_id — identifiants du listing
-          asset_id / assetid       — Steam asset ID
-          market_hash_name
-          wear                     — float value (0.0–1.0)
-          pattern                  — paint seed (entier)
-          sale_price               — prix en centimes (EUR)
-          stattrak                 — booléen
-          stickers                 — liste de dicts {name, wear, ...}
-        """
-        # Identifiant stable : on préfère sale_id, fallback id_
         sale_id = (
             sale.get("sale_id")
             or sale.get("id_")
@@ -174,32 +199,24 @@ class SkinportIngestor:
         if not sale_id or not market_hash_name:
             return None
 
-        # Prix en centimes → USD (Skinport renvoie en centimes dans la devise demandée)
         raw_price = sale.get("sale_price") or sale.get("price") or 0
         try:
-            price_cents_eur = int(raw_price)
-            # Conversion EUR→USD approximative : on stocke en USD comme les autres plateformes
-            # À ajuster si Skinport renvoie directement en USD selon le paramètre currency
-            price_cents = price_cents_eur  # stocker tel quel, convertir à l'affichage
+            price_cents = int(raw_price)
         except (ValueError, TypeError):
             return None
 
-        # Filtre de prix (config.MIN/MAX_PRICE_USD en USD, Skinport en EUR — approximation)
         price_approx_usd = price_cents / 100.0
         if price_approx_usd < config.MIN_PRICE_USD or price_approx_usd > config.MAX_PRICE_USD:
             return None
 
-        # Float value
         wear = sale.get("wear")
         try:
             float_value = float(wear) if wear is not None else None
         except (ValueError, TypeError):
             float_value = None
-
         if float_value is not None and float_value <= 0:
             float_value = None
 
-        # Paint seed
         pattern = sale.get("pattern")
         try:
             paint_seed = int(pattern) if pattern is not None else None
@@ -213,7 +230,7 @@ class SkinportIngestor:
             "sale_id": str(sale_id),
             "asset_id": sale.get("asset_id") or sale.get("assetid"),
             "market_hash_name": market_hash_name,
-            "price": price_cents,               # en centimes EUR
+            "price": price_cents,
             "float_value": float_value,
             "paint_seed": paint_seed,
             "stickers": stickers,
