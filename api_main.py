@@ -117,29 +117,58 @@ def get_bot_status():
     }
 
 @app.get("/api/stats")
-def get_global_stats():
-    """Calcule et retourne les statistiques globales d'observation."""
+def get_global_stats(
+    platform: str = Query(default=None),
+    speed: str = Query(default=None),
+    confidence: str = Query(default=None),
+):
+    """Calcule et retourne les statistiques globales d'observation, avec filtres optionnels."""
     conn = get_db_connection()
     try:
-        # Total des transactions
-        total_tx = conn.execute("SELECT COUNT(*) FROM transactions;").fetchone()[0]
-        
-        # TTD Moyen
-        avg_ttd_row = conn.execute("SELECT AVG(ttd_ms) FROM transactions;").fetchone()[0]
+        def build_where(extra_speed_clause: str = "") -> tuple[str, list]:
+            clauses = ["1=1"]
+            params = []
+            if platform:
+                clauses.append("platform = ?")
+                params.append(platform)
+            if confidence and confidence.upper() in {"HIGH", "MEDIUM", "LOW"}:
+                clauses.append("confidence = ?")
+                params.append(confidence.upper())
+            if extra_speed_clause:
+                clauses.append(extra_speed_clause)
+            return "WHERE " + " AND ".join(clauses), params
+
+        # Apply speed filter globally when set
+        global_speed = ""
+        if speed == "bot":
+            global_speed = "ttd_ms < 5000"
+        elif speed == "quick":
+            global_speed = "ttd_ms >= 5000 AND ttd_ms < 60000"
+        elif speed == "normal":
+            global_speed = "ttd_ms >= 60000"
+
+        where_base, params_base = build_where(global_speed)
+
+        total_tx = conn.execute(f"SELECT COUNT(*) FROM transactions {where_base};", params_base).fetchone()[0]
+        avg_ttd_row = conn.execute(f"SELECT AVG(ttd_ms) FROM transactions {where_base};", params_base).fetchone()[0]
         avg_ttd = round(avg_ttd_row / 1000.0, 2) if avg_ttd_row else 0.0
-        
-        # Snipes bot (< 5s)
-        bot_snipes = conn.execute("SELECT COUNT(*) FROM transactions WHERE ttd_ms < 5000;").fetchone()[0]
-        
-        # Achats rapides (>= 5s et < 60s)
-        quick_buys = conn.execute("SELECT COUNT(*) FROM transactions WHERE ttd_ms >= 5000 AND ttd_ms < 60000;").fetchone()[0]
-        
-        # Ventes normales (>= 60s)
-        normal_sales = conn.execute("SELECT COUNT(*) FROM transactions WHERE ttd_ms >= 60000;").fetchone()[0]
-        
-        # Listings actifs en cours d'observation
+
+        # Speed breakdown — only relevant when no global speed filter
+        if not speed:
+            where_bot, p_bot = build_where("ttd_ms < 5000")
+            where_quick, p_quick = build_where("ttd_ms >= 5000 AND ttd_ms < 60000")
+            where_normal, p_normal = build_where("ttd_ms >= 60000")
+        else:
+            where_bot, p_bot = where_base, params_base
+            where_quick, p_quick = where_base, params_base
+            where_normal, p_normal = where_base, params_base
+
+        bot_snipes = conn.execute(f"SELECT COUNT(*) FROM transactions {where_bot};", p_bot).fetchone()[0]
+        quick_buys = conn.execute(f"SELECT COUNT(*) FROM transactions {where_quick};", p_quick).fetchone()[0]
+        normal_sales = conn.execute(f"SELECT COUNT(*) FROM transactions {where_normal};", p_normal).fetchone()[0]
+
         active_listings = conn.execute("SELECT COUNT(*) FROM observed_listings;").fetchone()[0]
-        
+
         return {
             "total_transactions": total_tx,
             "average_ttd_seconds": avg_ttd,
@@ -240,9 +269,10 @@ def get_transactions(
 def get_top_items(
     limit: int = Query(default=15, ge=1, le=100),
     platform: str = Query(default=None),
-    speed: str = Query(default=None)
+    speed: str = Query(default=None),
+    confidence: str = Query(default=None),
 ):
-    """Retourne la liste des items les plus fréquemment achetés avec filtrage optionnel par plateforme et vitesse."""
+    """Retourne la liste des items les plus fréquemment achetés avec filtrage optionnel par plateforme, vitesse et fiabilité."""
     conn = get_db_connection()
     try:
         query = """
@@ -251,7 +281,7 @@ def get_top_items(
         WHERE 1=1
         """
         params = []
-        
+
         # Filtrage par vitesse (si non spécifié, défaut à < 60s pour la notion de snipe)
         if speed == "bot":
             query += " AND ttd_ms < 5000"
@@ -261,10 +291,14 @@ def get_top_items(
             query += " AND ttd_ms >= 60000"
         else:
             query += " AND ttd_ms < 60000"
-            
+
         if platform:
             query += " AND platform = ?"
             params.append(platform)
+
+        if confidence and confidence.upper() in {"HIGH", "MEDIUM", "LOW"}:
+            query += " AND confidence = ?"
+            params.append(confidence.upper())
             
         query += """
         GROUP BY market_hash_name
