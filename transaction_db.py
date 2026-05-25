@@ -90,6 +90,7 @@ class TransactionDatabase:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_name_float ON transactions (market_hash_name, float_value);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_opp_name ON opportunities (market_hash_name);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_name ON observed_listings (market_hash_name);")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_platform ON observed_listings (platform);")
                 # Migrations pour BD existante
                 try:
                     conn.execute("ALTER TABLE transactions ADD COLUMN confidence TEXT NOT NULL DEFAULT 'LOW';")
@@ -160,11 +161,6 @@ class TransactionDatabase:
                 conn.close()
 
         stickers_json = json.dumps(sticker_names or [])
-
-        # Debug temporaire : logger un traceback si float est None/0 juste avant INSERT
-        if not float_value or float_value <= 0:
-            import traceback
-            logger.error(f"INSERT_NO_FLOAT_BUG: {market_hash_name} fv={float_value!r}\n{''.join(traceback.format_stack())}")
 
         query = """
         INSERT INTO transactions (

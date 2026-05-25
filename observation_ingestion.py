@@ -362,6 +362,8 @@ class ObservationIngestor:
                 start_time = time.perf_counter()
                 logger.info("Début de la boucle de réconciliation différée CSFloat...")
 
+                self.observer._db.clean_old_observed_listings(config.OBSERVER_MAX_TTD_SEC)
+
                 pending = self.observer._db.get_pending_observed_listings("csfloat")
                 if not pending:
                     logger.debug("Aucun listing CSFloat en attente de réconciliation.")
@@ -777,6 +779,14 @@ class ObservationIngestor:
                         status_code, is_still_active = await self._verify_market_csgo_listing(
                             c, session
                         )
+                        if status_code == 200 and is_still_active:
+                            logger.info(
+                                f"Market.CSGO: Vente non trouvée immédiatement pour {c.get('name')} "
+                                f"({c.get('listing_id')}). Planification d'une vérification différée dans 75 minutes."
+                            )
+                            asyncio.create_task(self._run_delayed_market_csgo_verification(c, session))
+                            self._verification_queue.task_done()
+                            continue
                 except Exception as e:
                     logger.error(f"Worker : exception pour {listing_id} ({platform}): {e}")
                     status_code = 500
@@ -1045,10 +1055,48 @@ class ObservationIngestor:
             logger.error(f"Waxpeer history exception for {listing_id}: {e}")
             return 500, True
 
+    async def _run_delayed_market_csgo_verification(self, candidate: dict, session: aiohttp.ClientSession) -> None:
+        """
+        Gère la double-vérification différée pour Market.CSGO afin de contourner le délai de cache
+        d'environ 1 heure sur leur API d'historique de ventes.
+        """
+        absent_seen = candidate.get("absent_first_seen_ts") or time.time()
+        # On attend 75 minutes (4500 secondes) depuis la disparition pour interroger l'historique
+        delay = (absent_seen + 4500) - time.time()
+        if delay > 0:
+            logger.info(
+                f"Market.CSGO: Vérification différée planifiée pour {candidate.get('name')} "
+                f"({candidate.get('listing_id')}) dans {delay/60:.1f} minutes."
+            )
+            await asyncio.sleep(delay)
+
+        attempts = candidate.get("_attempts", 0)
+        try:
+            status_code, is_still_active = await self._verify_market_csgo_listing(candidate, session)
+            if status_code == 429:
+                candidate["_attempts"] = attempts + 1
+                if candidate["_attempts"] < 3:
+                    logger.warning(f"Market.CSGO: Rate limit lors de la vérification différée de {candidate.get('name')}. Réessai dans 5 min.")
+                    await asyncio.sleep(300)
+                    asyncio.create_task(self._run_delayed_market_csgo_verification(candidate, session))
+                    return
+                else:
+                    is_still_active = True
+            
+            self.observer.confirm_disappearance(candidate["listing_id"], is_still_active)
+        except Exception as e:
+            logger.error(f"Market.CSGO: Erreur lors de la vérification différée de {candidate.get('listing_id')} : {e}")
+            self.observer.confirm_disappearance(candidate["listing_id"], is_still_active=True)
+
     async def _get_market_csgo_history_id(self, name: str, session: aiohttp.ClientSession) -> Optional[int]:
         if not hasattr(self, "_market_csgo_history_ids"):
             url = "https://market.csgo.com/api/v2/full-history/all.json"
-            headers = {"User-Agent": "Mozilla/5.0"}
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/120.0.0.0"
+                )
+            }
             try:
                 async with session.get(url, headers=headers, timeout=10) as response:
                     if response.status == 200:
@@ -1079,7 +1127,12 @@ class ObservationIngestor:
             return 404, True
 
         url = f"https://market.csgo.com/api/v2/full-history/{item_id}.json"
-        headers = {"User-Agent": "Mozilla/5.0"}
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/120.0.0.0"
+            )
+        }
 
         try:
             async with session.get(url, headers=headers, timeout=5) as response:
@@ -1183,7 +1236,23 @@ class ObservationIngestor:
             pass
 
         def on_snapshot(listings: list, market_hash_name: str):
-            candidates = self.observer.record_snapshot(listings, platform="market_csgo", auto_confirm=False, skin_name=market_hash_name)
+            flattened = []
+            for listing in listings:
+                item_data = listing.get("item") or {}
+                stickers = item_data.get("stickers") or []
+                flat = {
+                    "id": listing.get("id"),
+                    "market_hash_name": listing.get("market_hash_name"),
+                    "price": listing.get("price"),
+                    "listed_at": listing.get("listed_at"),
+                    "float_value": item_data.get("float_value"),
+                    "paint_seed": item_data.get("paint_seed"),
+                    "sticker_count": len(stickers),
+                    "sticker_names": [s["name"] for s in stickers if isinstance(s, dict) and "name" in s],
+                }
+                flattened.append(flat)
+            logger.info(f"on_snapshot: {market_hash_name} - received {len(listings)} listings - flattened {len(flattened)}")
+            candidates = self.observer.record_snapshot(flattened, platform="market_csgo", auto_confirm=False, skin_name=market_hash_name)
             if candidates:
                 self._enqueue_candidates(candidates, "market_csgo")
 

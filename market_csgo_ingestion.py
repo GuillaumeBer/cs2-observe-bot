@@ -24,6 +24,8 @@ class MarketCSGOIngestor:
         self.api_key = config.MARKET_CSGO_API_KEY
         self.name_id_map = {}
         self._processed_ids = FIFOUniqueCache(maxsize=5000)
+        self._skin_cooldowns = {}
+        self._request_semaphore = asyncio.Semaphore(2)
         
         self._client: Optional[centrifuge.Client] = None
         self._sub: Optional[centrifuge.Subscription] = None
@@ -196,7 +198,7 @@ class MarketCSGOIngestor:
         Traite un événement de changement de prix Market.CSGO.
         Déclenche un snapshot REST pour tout changement de prix au-dessus du seuil MIN_PRICE_USD.
         """
-        item_id = str(item.get("id") or item.get("name_id") or "")
+        item_id = str(item.get("name_id") or item.get("id") or "")
         min_price_usd_str = item.get("min") or item.get("price")
 
         if not item_id or min_price_usd_str is None:
@@ -214,44 +216,60 @@ class MarketCSGOIngestor:
         if not market_hash_name:
             return
 
-        await self._fetch_and_process_specific_listings(market_hash_name)
+        asyncio.create_task(self._fetch_and_process_specific_listings(market_hash_name))
 
     async def _fetch_and_process_specific_listings(self, market_hash_name: str):
+        # Cooldown per skin to avoid spamming the REST API
+        now = time.perf_counter()
+        last_fetched = self._skin_cooldowns.get(market_hash_name, 0.0)
+        if now - last_fetched < 10.0:
+            return
+        self._skin_cooldowns[market_hash_name] = now
+
         url = "https://market.csgo.com/api/v2/search-item-by-hash-name-specific"
         params = {"key": self.api_key, "hash_name": market_hash_name}
-        try:
-            request_start = time.perf_counter()
-            async with self._session.get(url, params=params, timeout=5) as response:
-                if response.status != 200:
-                    logger.error(f"HTTP error during details search: {response.status}")
-                    return
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+        async with self._request_semaphore:
+            try:
+                request_start = time.perf_counter()
+                async with self._session.get(url, params=params, headers=headers, timeout=15) as response:
+                    if response.status != 200:
+                        logger.error(f"HTTP error during details search: {response.status}")
+                        return
 
-                data = await response.json()
-                listings = data.get("data", [])
+                    data = await response.json()
+                    listings = data.get("data", [])
+                    logger.info(f"Market.CSGO: successfully fetched {len(listings)} listings for {market_hash_name} in {time.perf_counter() - request_start:.2f}s")
 
-                if self.on_snapshot_callback:
-                    normalized_listings = []
+                    if self.on_snapshot_callback:
+                        normalized_listings = []
+                        for listing in listings:
+                            norm = self._normalize_listing(listing, market_hash_name)
+                            if norm:
+                                normalized_listings.append(norm)
+                        self.on_snapshot_callback(normalized_listings, market_hash_name)
+
                     for listing in listings:
-                        norm = self._normalize_listing(listing, market_hash_name)
-                        if norm:
-                            normalized_listings.append(norm)
-                    self.on_snapshot_callback(normalized_listings, market_hash_name)
+                        listing_id = str(listing.get("id"))
+                        if not listing_id:
+                            continue
 
-                for listing in listings:
-                    listing_id = str(listing.get("id"))
-                    if not listing_id:
-                        continue
+                        if not self._processed_ids.add(listing_id):
+                            continue
+                        
+                        normalized = self._normalize_listing(listing, market_hash_name)
+                        if normalized:
+                            normalized["_request_start"] = request_start
+                            self.callback(normalized)
 
-                    if not self._processed_ids.add(listing_id):
-                        continue
-                    
-                    normalized = self._normalize_listing(listing, market_hash_name)
-                    if normalized:
-                        normalized["_request_start"] = request_start
-                        self.callback(normalized)
-
-        except Exception as e:
-            logger.error(f"Exception while retrieving specific listings for {market_hash_name}: {e}")
+            except Exception as e:
+                import traceback
+                logger.error(f"Exception while retrieving specific listings for {market_hash_name}: {e}\n{traceback.format_exc()}")
 
     def _normalize_listing(self, listing: dict, market_hash_name: str) -> Optional[dict]:
         listing_id = listing.get("id")
