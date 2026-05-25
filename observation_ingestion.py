@@ -1335,6 +1335,12 @@ class ObservationIngestor:
                                     if raw_id in current_ids:
                                         continue
 
+                                    # Déduplication inter-cycles : évite d'enregistrer 2x le même listing
+                                    sale_sig = item["listing_id"]
+                                    if not self._matched_sales_cache.add(sale_sig):
+                                        sold_ids.append(item["listing_id"])
+                                        continue
+
                                     # Item disparu → vendu
                                     if item.get("listed_at") is not None:
                                         first_ts = float(item["listed_at"])
