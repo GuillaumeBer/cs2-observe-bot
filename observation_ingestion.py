@@ -70,6 +70,9 @@ class ObservationIngestor:
             self._tasks.append(
                 asyncio.create_task(self._observe_market_csgo(session))
             )
+            self._tasks.append(
+                asyncio.create_task(self._deferred_market_csgo_reconciliation_loop(session))
+            )
 
         self._tasks.append(
             asyncio.create_task(self._display_loop())
@@ -1236,29 +1239,35 @@ class ObservationIngestor:
             pass
 
         def on_snapshot(listings: list, market_hash_name: str):
-            flattened = []
+            now_iso = datetime.now(timezone.utc).isoformat()
+            new_count = 0
             for listing in listings:
+                listing_id = listing.get("id")
                 item_data = listing.get("item") or {}
+                float_value = item_data.get("float_value")
+                if not listing_id or not float_value or float_value <= 0:
+                    continue
                 stickers = item_data.get("stickers") or []
-                flat = {
-                    "id": listing.get("id"),
-                    "market_hash_name": listing.get("market_hash_name"),
-                    "price": listing.get("price"),
-                    "listed_at": listing.get("listed_at"),
-                    "float_value": item_data.get("float_value"),
-                    "paint_seed": item_data.get("paint_seed"),
-                    "sticker_count": len(stickers),
-                    "sticker_names": [s["name"] for s in stickers if isinstance(s, dict) and "name" in s],
-                }
-                flattened.append(flat)
-            logger.info(f"on_snapshot: {market_hash_name} - received {len(listings)} listings - flattened {len(flattened)}")
-            candidates = self.observer.record_snapshot(flattened, platform="market_csgo", auto_confirm=False, skin_name=market_hash_name)
-            if candidates:
-                self._enqueue_candidates(candidates, "market_csgo")
+                saved = self.observer._db.save_observed_listing(
+                    listing_id=listing_id,
+                    market_hash_name=market_hash_name,
+                    price_cents=listing.get("price", 0),
+                    platform="market_csgo",
+                    float_value=float_value,
+                    paint_seed=item_data.get("paint_seed"),
+                    sticker_count=len(stickers),
+                    sticker_names=[s["name"] for s in stickers if isinstance(s, dict) and "name" in s],
+                    timestamp=now_iso,
+                    listed_at=None,
+                )
+                if saved:
+                    new_count += 1
+            if new_count > 0:
+                logger.debug(f"Market.CSGO: {new_count} nouveaux listings enregistrés pour {market_hash_name}")
 
         ingestor = MarketCSGOIngestor(callback=on_new, on_snapshot_callback=on_snapshot)
         await ingestor.start(session=session)
-        
+
         try:
             while self.is_running:
                 await asyncio.sleep(1)
@@ -1266,3 +1275,133 @@ class ObservationIngestor:
             pass
         finally:
             await ingestor.stop()
+
+    async def _deferred_market_csgo_reconciliation_loop(self, session: aiohttp.ClientSession) -> None:
+        """
+        Réconcilie les listings Market.CSGO observés avec l'API de recherche.
+        Pour chaque skin ayant eu une mise à jour de prix récente (dirty), on re-interroge
+        l'API pour détecter quels listings ont disparu (vendus).
+        """
+        await asyncio.sleep(60)
+
+        while self.is_running:
+            try:
+                start_time = time.perf_counter()
+                logger.info("Début de la boucle de réconciliation différée Market.CSGO...")
+
+                self.observer._db.clean_old_observed_listings(config.OBSERVER_MAX_TTD_SEC)
+
+                pending = self.observer._db.get_pending_observed_listings("market_csgo")
+                if not pending:
+                    logger.debug("Aucun listing Market.CSGO en attente de réconciliation.")
+                    await asyncio.sleep(120)
+                    continue
+
+                by_skin: dict = {}
+                for p in pending:
+                    by_skin.setdefault(p["market_hash_name"], []).append(p)
+
+                logger.info(f"Réconciliation Market.CSGO : {len(pending)} listings sur {len(by_skin)} skins...")
+
+                matched_count = 0
+                sold_ids: list = []
+
+                url_search = "https://market.csgo.com/api/v2/search-item-by-hash-name-specific"
+                headers = {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    )
+                }
+
+                for skin_name, listings in by_skin.items():
+                    if not self.is_running:
+                        break
+
+                    await asyncio.sleep(1.0)
+
+                    params = {"key": config.MARKET_CSGO_API_KEY, "hash_name": skin_name}
+                    try:
+                        async with session.get(url_search, params=params, headers=headers, timeout=15) as response:
+                            if response.status == 200:
+                                data = await response.json()
+                                current_raw = data.get("data", []) or []
+                                current_ids = {str(l.get("id")) for l in current_raw if l.get("id")}
+
+                                now_ts = time.time()
+
+                                for item in listings:
+                                    raw_id = item["listing_id"].replace("market_csgo_", "")
+                                    if raw_id in current_ids:
+                                        continue
+
+                                    # Item disparu → vendu
+                                    if item.get("listed_at") is not None:
+                                        first_ts = float(item["listed_at"])
+                                    else:
+                                        try:
+                                            from email.utils import parsedate_to_datetime as _p
+                                            first_ts = datetime.fromisoformat(
+                                                item["timestamp"].replace("Z", "+00:00")
+                                            ).timestamp()
+                                        except Exception:
+                                            continue
+
+                                    ttd_ms = max(0.0, (now_ts - first_ts) * 1000)
+                                    if ttd_ms > config.OBSERVER_MAX_TTD_SEC * 1000:
+                                        sold_ids.append(item["listing_id"])
+                                        continue
+
+                                    if ttd_ms < config.OBS_BOT_SNIPE_TTD_MS:
+                                        category = "BOT_SNIPE"
+                                    elif ttd_ms < config.OBS_FAST_HUMAN_TTD_MS:
+                                        category = "FAST_HUMAN"
+                                    else:
+                                        category = "NORMAL_SALE"
+
+                                    try:
+                                        sticker_names = json.loads(item["sticker_names"])
+                                    except Exception:
+                                        sticker_names = []
+
+                                    logger.info(
+                                        f"MATCH Market.CSGO: {skin_name} | "
+                                        f"Prix: ${item['price_cents'] / 100.0:.2f} | "
+                                        f"TTD: {ttd_ms / 1000:.1f}s | Catégorie: {category}"
+                                    )
+
+                                    self.observer._db.save_transaction(
+                                        market_hash_name=skin_name,
+                                        price_usd=item["price_cents"] / 100.0,
+                                        ttd_ms=ttd_ms,
+                                        platform="market_csgo",
+                                        category=category,
+                                        float_value=item["float_value"],
+                                        paint_seed=item["paint_seed"],
+                                        sticker_count=item["sticker_count"],
+                                        sticker_names=sticker_names,
+                                        confidence="MEDIUM",
+                                    )
+                                    sold_ids.append(item["listing_id"])
+                                    matched_count += 1
+
+                            elif response.status == 429:
+                                logger.warning("Market.CSGO reconciliation rate limited. Pause 30s.")
+                                await asyncio.sleep(30)
+                            else:
+                                logger.warning(f"Market.CSGO reconciliation HTTP {response.status} pour {skin_name}")
+                    except Exception as skin_err:
+                        logger.error(f"Erreur réconciliation Market.CSGO pour {skin_name}: {skin_err}")
+
+                if sold_ids:
+                    self.observer._db.delete_observed_listings(sold_ids)
+
+                elapsed = time.perf_counter() - start_time
+                logger.info(
+                    f"Réconciliation Market.CSGO terminée : {matched_count} ventes détectées en {elapsed:.1f}s."
+                )
+
+            except Exception as loop_err:
+                logger.error(f"Erreur boucle réconciliation Market.CSGO : {loop_err}")
+
+            await asyncio.sleep(120)
