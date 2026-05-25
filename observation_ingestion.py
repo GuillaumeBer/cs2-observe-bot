@@ -1330,23 +1330,22 @@ class ObservationIngestor:
 
                                 now_ts = time.time()
 
+                                # Phase 1 — collecter les items disparus avec leur TTD
+                                disappeared: list = []
                                 for item in listings:
                                     raw_id = item["listing_id"].replace("market_csgo_", "")
                                     if raw_id in current_ids:
                                         continue
 
-                                    # Déduplication inter-cycles : évite d'enregistrer 2x le même listing
-                                    sale_sig = item["listing_id"]
-                                    if not self._matched_sales_cache.add(sale_sig):
+                                    # Déduplication inter-cycles
+                                    if not self._matched_sales_cache.add(item["listing_id"]):
                                         sold_ids.append(item["listing_id"])
                                         continue
 
-                                    # Item disparu → vendu
                                     if item.get("listed_at") is not None:
                                         first_ts = float(item["listed_at"])
                                     else:
                                         try:
-                                            from email.utils import parsedate_to_datetime as _p
                                             first_ts = datetime.fromisoformat(
                                                 item["timestamp"].replace("Z", "+00:00")
                                             ).timestamp()
@@ -1358,38 +1357,89 @@ class ObservationIngestor:
                                         sold_ids.append(item["listing_id"])
                                         continue
 
-                                    if ttd_ms < config.OBS_BOT_SNIPE_TTD_MS:
-                                        category = "BOT_SNIPE"
-                                    elif ttd_ms < config.OBS_FAST_HUMAN_TTD_MS:
-                                        category = "FAST_HUMAN"
-                                    else:
-                                        category = "NORMAL_SALE"
+                                    disappeared.append((item, first_ts, ttd_ms))
 
-                                    try:
-                                        sticker_names = json.loads(item["sticker_names"])
-                                    except Exception:
-                                        sticker_names = []
+                                if not disappeared:
+                                    pass
+                                else:
+                                    # Phase 2 — un seul appel à l'historique pour ce skin
+                                    skin_history: list = []
+                                    hist_clock_offset = 0.0
+                                    item_id = await self._get_market_csgo_history_id(skin_name, session)
+                                    if item_id:
+                                        hist_url = f"https://market.csgo.com/api/v2/full-history/{item_id}.json"
+                                        try:
+                                            async with session.get(hist_url, headers=headers, timeout=10) as hr:
+                                                if hr.status == 200:
+                                                    hbody = await hr.json()
+                                                    skin_history = hbody.get("data", {}).get("history", []) or []
+                                                    srv_date = hr.headers.get("Date")
+                                                    if srv_date:
+                                                        try:
+                                                            from email.utils import parsedate_to_datetime as _p2
+                                                            hist_clock_offset = time.time() - _p2(srv_date).timestamp()
+                                                        except Exception:
+                                                            pass
+                                                elif hr.status == 429:
+                                                    logger.warning("Market.CSGO history rate limited durant réconciliation.")
+                                                    await asyncio.sleep(30)
+                                        except Exception as he:
+                                            logger.warning(f"Market.CSGO history fetch failed pour {skin_name}: {he}")
 
-                                    logger.info(
-                                        f"MATCH Market.CSGO: {skin_name} | "
-                                        f"Prix: ${item['price_cents'] / 100.0:.2f} | "
-                                        f"TTD: {ttd_ms / 1000:.1f}s | Catégorie: {category}"
-                                    )
+                                    # Phase 3 — assigner HIGH/MEDIUM et enregistrer
+                                    for item, first_ts, ttd_ms in disappeared:
+                                        if ttd_ms < config.OBS_BOT_SNIPE_TTD_MS:
+                                            category = "BOT_SNIPE"
+                                        elif ttd_ms < config.OBS_FAST_HUMAN_TTD_MS:
+                                            category = "FAST_HUMAN"
+                                        else:
+                                            category = "NORMAL_SALE"
 
-                                    self.observer._db.save_transaction(
-                                        market_hash_name=skin_name,
-                                        price_usd=item["price_cents"] / 100.0,
-                                        ttd_ms=ttd_ms,
-                                        platform="market_csgo",
-                                        category=category,
-                                        float_value=item["float_value"],
-                                        paint_seed=item["paint_seed"],
-                                        sticker_count=item["sticker_count"],
-                                        sticker_names=sticker_names,
-                                        confidence="MEDIUM",
-                                    )
-                                    sold_ids.append(item["listing_id"])
-                                    matched_count += 1
+                                        candidate_price_usd = item["price_cents"] / 100.0
+                                        market_first = first_ts - hist_clock_offset
+                                        market_absent = now_ts - hist_clock_offset
+                                        confidence = "MEDIUM"
+
+                                        for sale in skin_history:
+                                            if len(sale) < 3:
+                                                continue
+                                            sale_date = float(sale[0])
+                                            sale_price = float(sale[2])
+                                            if (
+                                                abs(sale_price - candidate_price_usd) < 0.01
+                                                and (market_first - 10.0) <= sale_date <= (market_absent + 10.0)
+                                            ):
+                                                hist_sig = f"market_csgo_{skin_name}_{sale_price:.2f}_{sale_date:.3f}"
+                                                if self._matched_sales_cache.add(hist_sig):
+                                                    confidence = "HIGH"
+                                                    break
+
+                                        try:
+                                            sticker_names = json.loads(item["sticker_names"])
+                                        except Exception:
+                                            sticker_names = []
+
+                                        logger.info(
+                                            f"MATCH Market.CSGO: {skin_name} | "
+                                            f"Prix: ${candidate_price_usd:.2f} | "
+                                            f"TTD: {ttd_ms / 1000:.1f}s | "
+                                            f"Catégorie: {category} | Confidence: {confidence}"
+                                        )
+
+                                        self.observer._db.save_transaction(
+                                            market_hash_name=skin_name,
+                                            price_usd=candidate_price_usd,
+                                            ttd_ms=ttd_ms,
+                                            platform="market_csgo",
+                                            category=category,
+                                            float_value=item["float_value"],
+                                            paint_seed=item["paint_seed"],
+                                            sticker_count=item["sticker_count"],
+                                            sticker_names=sticker_names,
+                                            confidence=confidence,
+                                        )
+                                        sold_ids.append(item["listing_id"])
+                                        matched_count += 1
 
                             elif response.status == 429:
                                 logger.warning("Market.CSGO reconciliation rate limited. Pause 30s.")
