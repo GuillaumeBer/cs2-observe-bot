@@ -41,7 +41,8 @@ class TransactionDatabase:
             ttd_ms REAL NOT NULL,
             category TEXT NOT NULL,
             platform TEXT NOT NULL,
-            confidence TEXT NOT NULL DEFAULT 'LOW'
+            confidence TEXT NOT NULL DEFAULT 'LOW',
+            ref_price_usd REAL
         );
         """
         query_opp = """
@@ -100,11 +101,50 @@ class TransactionDatabase:
                     conn.execute("ALTER TABLE observed_listings ADD COLUMN listed_at REAL;")
                 except Exception:
                     pass
+                try:
+                    conn.execute("ALTER TABLE transactions ADD COLUMN ref_price_usd REAL;")
+                except Exception:
+                    pass
             logger.info("Base de données des transactions et opportunités initialisée avec succès.")
         except Exception as e:
             logger.error(f"Erreur d'initialisation de la base de données : {e}")
         finally:
             conn.close()
+
+    def _compute_ref_price(self, market_hash_name: str, before_timestamp: str, limit: int = 50) -> Optional[float]:
+        """
+        Calcule le prix de référence marché pour un item au moment d'une transaction,
+        en utilisant uniquement les ventes passées (avant before_timestamp) et en
+        excluant les snipes bots pour éviter le biais vers le bas.
+        Retourne None si moins de 3 ventes historiques disponibles.
+        """
+        seuil_bot_ms = getattr(config, "OBS_BOT_SNIPE_TTD_MS", 5000)
+        query = """
+        SELECT price_usd FROM transactions
+        WHERE market_hash_name = ?
+          AND ttd_ms >= ?
+          AND timestamp < ?
+        ORDER BY timestamp DESC
+        LIMIT ?;
+        """
+        conn = self._get_connection()
+        prices = []
+        try:
+            cursor = conn.execute(query, (market_hash_name, seuil_bot_ms, before_timestamp, limit))
+            prices = [row["price_usd"] for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Erreur calcul ref_price pour {market_hash_name} : {e}")
+        finally:
+            conn.close()
+
+        if len(prices) < 3:
+            return None
+
+        prices.sort()
+        n = len(prices)
+        if n % 2 == 1:
+            return prices[n // 2]
+        return (prices[n // 2 - 1] + prices[n // 2]) / 2.0
 
     def save_transaction(
         self,
@@ -131,6 +171,8 @@ class TransactionDatabase:
         # Seuls les skins avec un float réel sont enregistrés (stickers/kits/charms exclus)
         if not float_value or float_value <= 0:
             return False
+
+        ref_price_usd = self._compute_ref_price(market_hash_name, before_timestamp=timestamp)
 
         # 1. Vérification anti-empoisonnement par float identique récent
         if float_value is not None and float_value > 0:
@@ -165,8 +207,9 @@ class TransactionDatabase:
         query = """
         INSERT INTO transactions (
             timestamp, market_hash_name, price_usd, float_value,
-            paint_seed, sticker_count, sticker_names, ttd_ms, category, platform, confidence
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            paint_seed, sticker_count, sticker_names, ttd_ms, category, platform, confidence,
+            ref_price_usd
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         conn = self._get_connection()
         try:
@@ -185,6 +228,7 @@ class TransactionDatabase:
                         category,
                         platform,
                         confidence,
+                        ref_price_usd,
                     )
                 )
             logger.debug(f"Transaction enregistrée pour {market_hash_name} à ${price_usd:.2f}")
@@ -504,6 +548,21 @@ class TransactionDatabase:
             conn.close()
         return results
 
+    def get_observed_listing_by_id(self, listing_id: str) -> Optional[dict]:
+        """Retourne un listing observé par son listing_id, ou None s'il n'existe pas."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT * FROM observed_listings WHERE listing_id = ?;",
+                (listing_id,)
+            ).fetchone()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Erreur get_observed_listing_by_id({listing_id}): {e}")
+            return None
+        finally:
+            conn.close()
+
     def delete_observed_listings(self, listing_ids: List[str]) -> bool:
         if not listing_ids:
             return True
@@ -523,15 +582,91 @@ class TransactionDatabase:
     def clean_old_observed_listings(self, age_seconds: float) -> int:
         conn = self._get_connection()
         count = 0
+        saved_count = 0
         try:
-            cutoff = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
-            cutoff_str = cutoff.isoformat()
-            query = "DELETE FROM observed_listings WHERE timestamp < ?;"
+            now = datetime.now(timezone.utc)
+            now_ts = now.timestamp()
+            now_str = now.isoformat()
+            cutoff_str = (now - timedelta(seconds=age_seconds)).isoformat()
+            cutoff_24h_str = (now - timedelta(seconds=86400)).isoformat()
+
+            # Récupérer les listings expirés pour des items ayant un historique de vente
+            expired = conn.execute("""
+                SELECT ol.* FROM observed_listings ol
+                WHERE ol.timestamp < ?
+                  AND ol.float_value > 0
+                  AND EXISTS (
+                      SELECT 1 FROM transactions t
+                      WHERE t.market_hash_name = ol.market_hash_name
+                      LIMIT 1
+                  );
+            """, (cutoff_str,)).fetchall()
+
             with conn:
-                cursor = conn.execute(query, (cutoff_str,))
+                for row in expired:
+                    r = dict(row)
+                    market_hash_name = r["market_hash_name"]
+                    float_value = r.get("float_value")
+                    if not float_value or float_value <= 0:
+                        continue
+
+                    # Calculer le TTD depuis la mise en vente réelle
+                    listed_at = r.get("listed_at")
+                    try:
+                        first_ts = float(listed_at) if listed_at else datetime.fromisoformat(
+                            r["timestamp"].replace("Z", "+00:00")
+                        ).timestamp()
+                    except Exception:
+                        continue
+
+                    ttd_ms = (now_ts - first_ts) * 1000
+
+                    # Ignorer si le même float a été enregistré comme vendu dans les 24h
+                    already_sold = conn.execute("""
+                        SELECT 1 FROM transactions
+                        WHERE market_hash_name = ? AND float_value = ? AND timestamp > ?
+                        LIMIT 1;
+                    """, (market_hash_name, float_value, cutoff_24h_str)).fetchone()
+                    if already_sold:
+                        continue
+
+                    ref_price_usd = self._compute_ref_price(market_hash_name, before_timestamp=now_str)
+
+                    try:
+                        sticker_names = json.dumps(json.loads(r.get("sticker_names") or "[]"))
+                    except Exception:
+                        sticker_names = "[]"
+
+                    conn.execute("""
+                        INSERT INTO transactions (
+                            timestamp, market_hash_name, price_usd, float_value,
+                            paint_seed, sticker_count, sticker_names, ttd_ms,
+                            category, platform, confidence, ref_price_usd
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """, (
+                        now_str,
+                        market_hash_name,
+                        r["price_cents"] / 100.0,
+                        float_value,
+                        r.get("paint_seed"),
+                        r.get("sticker_count", 0),
+                        sticker_names,
+                        ttd_ms,
+                        "EXPIRED",
+                        r["platform"],
+                        "HIGH",
+                        ref_price_usd,
+                    ))
+                    saved_count += 1
+
+                cursor = conn.execute("DELETE FROM observed_listings WHERE timestamp < ?;", (cutoff_str,))
                 count = cursor.rowcount
+
             if count > 0:
-                logger.info(f"Nettoyage de {count} listings observés expirés (> {age_seconds/3600:.1f}h).")
+                logger.info(
+                    f"Nettoyage de {count} listings expirés (>{age_seconds/3600:.1f}h) "
+                    f"— {saved_count} enregistrés comme EXPIRED."
+                )
         except Exception as e:
             logger.error(f"Erreur lors du nettoyage des vieux listings observés : {e}")
         finally:

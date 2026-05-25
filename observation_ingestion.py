@@ -73,6 +73,10 @@ class ObservationIngestor:
             self._tasks.append(
                 asyncio.create_task(self._deferred_market_csgo_reconciliation_loop(session))
             )
+        if self.platform in ("skinport", "all") and config.SKINPORT_ENABLED:
+            self._tasks.append(
+                asyncio.create_task(self._observe_skinport(session))
+            )
 
         self._tasks.append(
             asyncio.create_task(self._display_loop())
@@ -1459,5 +1463,164 @@ class ObservationIngestor:
 
             except Exception as loop_err:
                 logger.error(f"Erreur boucle réconciliation Market.CSGO : {loop_err}")
+
+            await asyncio.sleep(120)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # BOUCLE D'OBSERVATION SKINPORT (WEBSOCKET SOCKET.IO + MSGPACK)
+    # Activation : config.SKINPORT_ENABLED = True
+    # Pas de clé API requise pour le flux public.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def _observe_skinport(self, session: aiohttp.ClientSession) -> None:
+        from skinport_ingestion import SkinportIngestor
+
+        logger.info("Skinport Observation : connexion au flux WebSocket saleFeed...")
+
+        # Cache mémoire sale_id -> listing_data pour lookup O(1) lors du "sold"
+        # (complément du stockage DB — survit aux courtes interruptions réseau)
+        _pending: dict = {}
+
+        def on_listed(listing: dict) -> None:
+            float_value = listing.get("float_value")
+            if not float_value or float_value <= 0:
+                return
+
+            sale_id = listing["sale_id"]
+            listing_id = listing["id"]  # "skinport_{sale_id}"
+
+            # Mémoriser dans le cache local
+            _pending[sale_id] = listing
+
+            # Persister en DB pour survivre à un redémarrage du bot
+            stickers = listing.get("stickers") or []
+            saved = self.observer._db.save_observed_listing(
+                listing_id=listing_id,
+                market_hash_name=listing["market_hash_name"],
+                price_cents=listing["price"],
+                platform="skinport",
+                float_value=float_value,
+                paint_seed=listing.get("paint_seed"),
+                sticker_count=len(stickers),
+                sticker_names=[s["name"] for s in stickers if isinstance(s, dict) and "name" in s],
+                timestamp=listing["ingested_at"],
+                listed_at=None,
+            )
+            if saved:
+                logger.debug(f"Skinport listed: {listing['market_hash_name']} (sale_id={sale_id})")
+
+        def on_sold(listing: dict) -> None:
+            sale_id = listing["sale_id"]
+            listing_id = listing["id"]
+
+            # Déduplication inter-événements
+            sale_sig = f"skinport_sold_{listing_id}"
+            if not self._matched_sales_cache.add(sale_sig):
+                return
+
+            # Lookup : cache mémoire d'abord, fallback DB
+            original = _pending.pop(sale_id, None)
+            if original is None:
+                original = self.observer._db.get_observed_listing_by_id(listing_id)
+            if original is None:
+                # Item listé avant le démarrage du bot — TTD inconnu
+                logger.debug(f"Skinport sold inconnu (listé avant démarrage): {listing['market_hash_name']}")
+                return
+
+            # Calcul TTD
+            try:
+                if isinstance(original, dict) and "ingested_at" in original:
+                    listed_ts = datetime.fromisoformat(
+                        original["ingested_at"].replace("Z", "+00:00")
+                    ).timestamp()
+                else:
+                    listed_ts = datetime.fromisoformat(
+                        original["timestamp"].replace("Z", "+00:00")
+                    ).timestamp()
+            except Exception:
+                return
+
+            now_ts = time.time()
+            ttd_ms = max(0.0, (now_ts - listed_ts) * 1000)
+
+            if ttd_ms > config.OBSERVER_MAX_TTD_SEC * 1000:
+                self.observer._db.delete_observed_listings([listing_id])
+                return
+
+            if ttd_ms < config.OBS_BOT_SNIPE_TTD_MS:
+                category = "BOT_SNIPE"
+            elif ttd_ms < config.OBS_FAST_HUMAN_TTD_MS:
+                category = "FAST_HUMAN"
+            else:
+                category = "NORMAL_SALE"
+
+            float_value = (
+                original.get("float_value")
+                if isinstance(original, dict)
+                else original["float_value"]
+            )
+            paint_seed = (
+                original.get("paint_seed")
+                if isinstance(original, dict)
+                else original["paint_seed"]
+            )
+            price_cents = (
+                original.get("price")
+                if isinstance(original, dict) and "price" in original
+                else original.get("price_cents", 0)
+            )
+            market_hash_name = (
+                original.get("market_hash_name", "")
+            )
+
+            sticker_names_raw = (
+                original.get("sticker_names")
+                if isinstance(original, dict)
+                else original.get("sticker_names", "[]")
+            )
+            if isinstance(sticker_names_raw, list):
+                sticker_names = sticker_names_raw
+            else:
+                try:
+                    sticker_names = json.loads(sticker_names_raw or "[]")
+                except Exception:
+                    sticker_names = []
+
+            sticker_count = (
+                len(original.get("stickers", []))
+                if isinstance(original, dict) and "stickers" in original
+                else original.get("sticker_count", 0)
+            )
+
+            logger.info(
+                f"MATCH Skinport: {market_hash_name} | "
+                f"Prix: ${price_cents / 100.0:.2f} | "
+                f"TTD: {ttd_ms / 1000:.1f}s | Catégorie: {category} | Confidence: HIGH"
+            )
+
+            self.observer._db.save_transaction(
+                market_hash_name=market_hash_name,
+                price_usd=price_cents / 100.0,
+                ttd_ms=ttd_ms,
+                platform="skinport",
+                category=category,
+                float_value=float_value,
+                paint_seed=paint_seed,
+                sticker_count=sticker_count,
+                sticker_names=sticker_names,
+                confidence="HIGH",
+            )
+            self.observer._db.delete_observed_listings([listing_id])
+
+        ingestor = SkinportIngestor(on_listed=on_listed, on_sold=on_sold)
+        await ingestor.start(session=session)
+
+        try:
+            while self.is_running:
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await ingestor.stop()
 
             await asyncio.sleep(120)

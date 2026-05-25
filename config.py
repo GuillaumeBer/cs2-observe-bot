@@ -23,6 +23,10 @@ DMARKET_SECRET_KEY = os.getenv("DMARKET_SECRET_KEY", "")
 MARKET_CSGO_API_KEY = os.getenv("MARKET_CSGO_API_KEY", "")
 MARKET_CSGO_ENABLED = False
 
+# Configuration Skinport (WebSocket public, pas de clé API requise pour l'observation)
+# Mettre True pour activer — aucune clé nécessaire
+SKINPORT_ENABLED = False
+
 # Configuration Waxpeer
 WAXPEER_API_KEY = os.getenv("WAXPEER_API_KEY", "")
 
