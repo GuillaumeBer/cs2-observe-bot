@@ -25,7 +25,7 @@ MARKET_CSGO_ENABLED = False
 
 # Configuration Skinport (WebSocket public, pas de clé API requise pour l'observation)
 # Mettre True pour activer — aucune clé nécessaire
-SKINPORT_ENABLED = True
+SKINPORT_ENABLED = False  # Cloudflare Bot Management bloque les connexions serveur
 
 # Configuration Waxpeer
 WAXPEER_API_KEY = os.getenv("WAXPEER_API_KEY", "")
