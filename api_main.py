@@ -162,6 +162,7 @@ def get_transactions(
     skin_name: str = Query(default=None),
     platform: str = Query(default=None),
     speed: str = Query(default=None), # 'bot', 'quick', 'normal'
+    confidence: str = Query(default=None), # 'HIGH', 'MEDIUM', 'LOW'
     sort_by: str = Query(default="timestamp"),
     sort_dir: str = Query(default="desc")
 ):
@@ -212,7 +213,13 @@ def get_transactions(
                 query += " AND ttd_ms >= 5000 AND ttd_ms < 60000"
             elif speed == "normal":
                 query += " AND ttd_ms >= 60000"
-                
+
+        if confidence:
+            allowed_confidences = {"HIGH", "MEDIUM", "LOW"}
+            if confidence.upper() in allowed_confidences:
+                query += " AND confidence = ?"
+                params.append(confidence.upper())
+
         query += f" ORDER BY {db_sort_col} {db_sort_dir} LIMIT ? OFFSET ?;"
         params.extend([limit, offset])
         
