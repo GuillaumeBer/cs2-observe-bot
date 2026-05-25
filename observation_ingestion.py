@@ -66,7 +66,7 @@ class ObservationIngestor:
             self._tasks.append(
                 asyncio.create_task(self._observe_waxpeer(session))
             )
-        if self.platform in ("market_csgo", "all"):
+        if self.platform in ("market_csgo", "all") and config.MARKET_CSGO_ENABLED:
             self._tasks.append(
                 asyncio.create_task(self._observe_market_csgo(session))
             )

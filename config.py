@@ -19,8 +19,9 @@ MAX_PRICE_USD = float(os.getenv("MAX_PRICE_USD", "150.0"))
 DMARKET_PUBLIC_KEY = os.getenv("DMARKET_PUBLIC_KEY", "")
 DMARKET_SECRET_KEY = os.getenv("DMARKET_SECRET_KEY", "")
 
-# Configuration Market.CSGO
+# Configuration Market.CSGO (DÉSACTIVÉ — clé API bloquée définitivement par Market.CSGO)
 MARKET_CSGO_API_KEY = os.getenv("MARKET_CSGO_API_KEY", "")
+MARKET_CSGO_ENABLED = False
 
 # Configuration Waxpeer
 WAXPEER_API_KEY = os.getenv("WAXPEER_API_KEY", "")
