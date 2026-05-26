@@ -66,8 +66,8 @@ async def main():
     parser.add_argument(
         "--platform",
         choices=["dmarket", "csfloat", "waxpeer", "market_csgo", "all"],
-        default="all",
-        help="Plateforme à observer (par défaut : 'all')"
+        default="dmarket",
+        help="Plateforme à observer (par défaut : 'dmarket')"
     )
     args = parser.parse_args()
 
