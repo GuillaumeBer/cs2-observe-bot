@@ -181,15 +181,13 @@ async def reconcile_skin(session: aiohttp.ClientSession, market_hash_name: str, 
             sale_dt = datetime.fromtimestamp(sale["sale_date"], timezone.utc)
             sale_timestamp_str = sale_dt.isoformat().replace("+00:00", "Z")
 
-            # Catégorisation simplifiée
-            category = "other"
-            name_lower = market_hash_name.lower()
-            if "knife" in name_lower or "★" in name_lower:
-                category = "knife"
-            elif "gloves" in name_lower:
-                category = "gloves"
-            elif "ak-47" in name_lower or "m4a1-s" in name_lower or "m4a4" in name_lower or "awp" in name_lower:
-                category = "rifle"
+            # Catégorisation par vitesse de vente (cohérente avec observer._process_disappearance)
+            if ttd_ms < config.OBS_BOT_SNIPE_TTD_MS:
+                category = "BOT_SNIPE"
+            elif ttd_ms < config.OBS_FAST_HUMAN_TTD_MS:
+                category = "FAST_HUMAN"
+            else:
+                category = "NORMAL_SALE"
 
             # Enregistrer la transaction
             saved = db.save_transaction(
