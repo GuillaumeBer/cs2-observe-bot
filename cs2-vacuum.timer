@@ -1,0 +1,10 @@
+[Unit]
+Description=Timer VACUUM SQLite hebdomadaire (chaque lundi à 03h00 UTC)
+
+[Timer]
+OnCalendar=Mon 03:00:00
+Persistent=true
+Unit=cs2-vacuum.service
+
+[Install]
+WantedBy=timers.target

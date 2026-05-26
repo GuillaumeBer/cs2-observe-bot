@@ -323,6 +323,107 @@ def get_top_items(
     finally:
         conn.close()
 
+@app.get("/api/ml-stats")
+def get_ml_stats():
+    """Statistiques du dataset pour l'entraînement ML et usage disque."""
+    import shutil
+
+    conn = get_db_connection()
+    try:
+        # Comptages par catégorie
+        rows = conn.execute("""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN category != 'EXPIRED' THEN 1 ELSE 0 END) as sold,
+                SUM(CASE WHEN category  = 'EXPIRED' THEN 1 ELSE 0 END) as expired,
+                SUM(CASE WHEN ref_price_usd IS NOT NULL THEN 1 ELSE 0 END) as with_ref_price,
+                SUM(CASE WHEN sticker_count > 0 THEN 1 ELSE 0 END) as with_stickers,
+                COUNT(DISTINCT market_hash_name) as unique_skins
+            FROM transactions;
+        """).fetchone()
+
+        total = rows["total"] or 0
+        sold = rows["sold"] or 0
+        expired = rows["expired"] or 0
+        with_ref = rows["with_ref_price"] or 0
+        unique_skins = rows["unique_skins"] or 0
+
+        # Distribution TTD (ventes seulement, pas les expirés)
+        dist = conn.execute("""
+            SELECT
+                SUM(CASE WHEN ttd_ms < 5000 THEN 1 ELSE 0 END) as bot,
+                SUM(CASE WHEN ttd_ms >= 5000 AND ttd_ms < 60000 THEN 1 ELSE 0 END) as fast,
+                SUM(CASE WHEN ttd_ms >= 60000 THEN 1 ELSE 0 END) as normal
+            FROM transactions WHERE category != 'EXPIRED';
+        """).fetchone()
+
+        # Top skins par nombre de points de données
+        top_skins = conn.execute("""
+            SELECT market_hash_name,
+                   COUNT(*) as total_points,
+                   SUM(CASE WHEN category != 'EXPIRED' THEN 1 ELSE 0 END) as sold_points,
+                   SUM(CASE WHEN category  = 'EXPIRED' THEN 1 ELSE 0 END) as expired_points,
+                   SUM(CASE WHEN ref_price_usd IS NOT NULL THEN 1 ELSE 0 END) as with_ref
+            FROM transactions
+            GROUP BY market_hash_name
+            ORDER BY total_points DESC
+            LIMIT 20;
+        """).fetchall()
+
+    except Exception as e:
+        logger.error(f"Erreur ml-stats : {e}")
+        raise HTTPException(status_code=500, detail="Error fetching ML stats")
+    finally:
+        conn.close()
+
+    # Disk usage
+    try:
+        disk = shutil.disk_usage("/home")
+    except Exception:
+        try:
+            disk = shutil.disk_usage("/")
+        except Exception:
+            disk = None
+
+    db_size_bytes = 0
+    try:
+        db_size_bytes = os.path.getsize(config.OBSERVER_DB_PATH)
+    except Exception:
+        pass
+
+    return {
+        "dataset": {
+            "total": total,
+            "sold": sold,
+            "expired": expired,
+            "unique_skins": unique_skins,
+            "with_ref_price": with_ref,
+            "ref_price_coverage_pct": round(with_ref / total * 100, 1) if total else 0,
+        },
+        "ttd_distribution": {
+            "bot_snipe": dist["bot"] if dist else 0,
+            "fast_human": dist["fast"] if dist else 0,
+            "normal_sale": dist["normal"] if dist else 0,
+        },
+        "disk": {
+            "total_bytes": disk.total if disk else 0,
+            "used_bytes": disk.used if disk else 0,
+            "free_bytes": disk.free if disk else 0,
+            "db_size_bytes": db_size_bytes,
+        },
+        "top_skins": [
+            {
+                "name": r["market_hash_name"],
+                "total": r["total_points"],
+                "sold": r["sold_points"],
+                "expired": r["expired_points"],
+                "with_ref": r["with_ref"],
+            }
+            for r in top_skins
+        ],
+    }
+
+
 if __name__ == "__main__":
     # Démarrage sur le port 8000 sur toutes les interfaces réseau (0.0.0.0)
     uvicorn.run("api_main:app", host="0.0.0.0", port=8000, reload=False)

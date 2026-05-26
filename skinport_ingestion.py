@@ -5,7 +5,14 @@ Architecture TTD :
   - Événement "listed"  → save_observed_listing() en DB + cache mémoire
   - Événement "sold"    → lookup par sale_id → TTD = sold_at - listed_at → HIGH confidence
 
-Le WebSocket public ne nécessite PAS de clé API pour l'observation.
+Mode de connexion :
+  - SKINPORT_USE_PLAYWRIGHT=True  → Playwright résout le challenge Cloudflare
+  - SKINPORT_USE_PLAYWRIGHT=False → Connexion directe (fonctionne si pas de Cloudflare)
+
+Limitations Cloudflare :
+  - IP datacenter (Oracle Cloud) → erreur 1005 (blocage dur, Playwright ne peut pas aider)
+  - IP résidentielle → JS challenge → Playwright le résout
+
 Activation : mettre SKINPORT_ENABLED = True dans config.py
 """
 
@@ -21,6 +28,11 @@ import config
 logger = logging.getLogger("cs2_sniper.skinport_ingestion")
 
 _WS_URL = "wss://skinport.com/socket.io/?EIO=4&transport=websocket"
+_DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 class SkinportIngestor:
@@ -42,6 +54,7 @@ class SkinportIngestor:
         self.is_running = False
         self._ws = None
         self._loop_task: Optional[asyncio.Task] = None
+        self._cf_bypass: Optional[Any] = None
 
     async def start(self, session=None):
         self.is_running = True
@@ -62,22 +75,36 @@ class SkinportIngestor:
                 pass
         logger.info("Skinport Ingestion stopped.")
 
+    async def _build_headers(self) -> dict:
+        """Construit les headers WebSocket, avec cookies Cloudflare si Playwright activé."""
+        headers = {
+            "Origin": "https://skinport.com",
+            "Referer": "https://skinport.com/",
+            "User-Agent": _DEFAULT_UA,
+        }
+
+        if self._cf_bypass:
+            try:
+                cookie_str, ua = await self._cf_bypass.get_valid_cookies()
+                if cookie_str:
+                    headers["Cookie"] = cookie_str
+                    headers["User-Agent"] = ua
+                    logger.debug(f"Skinport: {len(cookie_str)} chars de cookies CF injectés.")
+            except Exception as e:
+                logger.error(f"Skinport: erreur récupération cookies CF: {e}")
+
+        return headers
+
     async def _run_websocket(self):
         retry_delay = 5
 
         while self.is_running:
             try:
+                headers = await self._build_headers()
+
                 async with websockets.connect(
                     _WS_URL,
-                    additional_headers={
-                        "Origin": "https://skinport.com",
-                        "Referer": "https://skinport.com/",
-                        "User-Agent": (
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/124.0.0.0 Safari/537.36"
-                        ),
-                    },
+                    additional_headers=headers,
                     ping_interval=None,
                     max_size=10 * 1024 * 1024,
                     open_timeout=15,
@@ -129,6 +156,17 @@ class SkinportIngestor:
 
             except asyncio.CancelledError:
                 break
+            except websockets.exceptions.InvalidStatus as e:
+                status_code = getattr(e.response, "status_code", None)
+                if status_code == 403 and self._cf_bypass:
+                    logger.warning("Skinport: 403 reçu — invalidation du cookie CF et retry immédiat.")
+                    self._cf_bypass.invalidate()
+                    # Pas de sleep : on va refaire la récupération de cookie au prochain tour
+                    continue
+                logger.error(f"Skinport WebSocket erreur HTTP {status_code}: {e} — reconnexion dans {retry_delay}s")
+                if self.is_running:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 60)
             except Exception as e:
                 logger.error(f"Skinport WebSocket erreur: {e} — reconnexion dans {retry_delay}s")
                 if self.is_running:
@@ -137,8 +175,6 @@ class SkinportIngestor:
 
     async def _handle_message(self, ws, raw: Any):
         if isinstance(raw, bytes):
-            # Skinport peut envoyer des frames binaires (msgpack) — on les ignore
-            # si on ne peut pas les parser sans msgpack
             try:
                 import msgpack
                 data = msgpack.unpackb(raw[1:], raw=False)  # skip EIO prefix byte

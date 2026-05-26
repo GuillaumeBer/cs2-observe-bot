@@ -23,9 +23,21 @@ DMARKET_SECRET_KEY = os.getenv("DMARKET_SECRET_KEY", "")
 MARKET_CSGO_API_KEY = os.getenv("MARKET_CSGO_API_KEY", "")
 MARKET_CSGO_ENABLED = False
 
-# Configuration Skinport (WebSocket public, pas de clé API requise pour l'observation)
-# Mettre True pour activer — aucune clé nécessaire
-SKINPORT_ENABLED = False  # Cloudflare Bot Management bloque les connexions serveur
+# Configuration Skinport
+# DÉSACTIVÉ : le saleFeed Socket.IO nécessite un login Skinport (session authentifiée).
+# Le polling HTTP (/socket.io/?transport=polling) retourne 403 sans authentification.
+# De plus, Oracle Cloud est bloqué par Cloudflare Bot Management (erreur 1005 = IP datacenter).
+#
+# Pour activer (depuis IP résidentielle avec login) :
+#   1. Fournir les credentials Skinport : SKINPORT_EMAIL + SKINPORT_PASSWORD dans .env
+#   2. Utiliser SkinportPlaywrightIngestor (skinport_cf_bypass.py) qui navigue,
+#      se connecte au compte, puis intercepte les WebSocket frames du saleFeed
+#   3. Mettre SKINPORT_ENABLED=true dans .env
+SKINPORT_ENABLED = os.getenv("SKINPORT_ENABLED", "false").lower() == "true"
+SKINPORT_EMAIL = os.getenv("SKINPORT_EMAIL", "")
+SKINPORT_PASSWORD = os.getenv("SKINPORT_PASSWORD", "")
+SKINPORT_USE_PLAYWRIGHT = os.getenv("SKINPORT_USE_PLAYWRIGHT", "false").lower() == "true"
+SKINPORT_PLAYWRIGHT_HEADLESS = os.getenv("SKINPORT_PLAYWRIGHT_HEADLESS", "true").lower() == "true"
 
 # Configuration Waxpeer
 WAXPEER_API_KEY = os.getenv("WAXPEER_API_KEY", "")

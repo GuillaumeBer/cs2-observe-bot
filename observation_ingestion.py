@@ -106,7 +106,9 @@ class ObservationIngestor:
         while self.is_running:
             cycle_start = time.perf_counter()
             try:
-                path = f"/exchange/v1/market/items?gameId=a8db&limit=100&orderBy=updated&orderDir=desc&currency=USD"
+                min_price_cents = int(config.MIN_PRICE_USD * 100)
+                max_price_cents = int(config.MAX_PRICE_USD * 100)
+                path = f"/exchange/v1/market/items?gameId=a8db&limit=100&orderBy=updated&orderDir=desc&currency=USD&priceFrom={min_price_cents}&priceTo={max_price_cents}"
                 headers = generate_dmarket_headers(
                     config.DMARKET_PUBLIC_KEY,
                     config.DMARKET_SECRET_KEY,
@@ -1473,9 +1475,16 @@ class ObservationIngestor:
     # ──────────────────────────────────────────────────────────────────────────
 
     async def _observe_skinport(self, session: aiohttp.ClientSession) -> None:
-        from skinport_ingestion import SkinportIngestor
+        use_playwright = getattr(config, "SKINPORT_USE_PLAYWRIGHT", False)
+        email = getattr(config, "SKINPORT_EMAIL", "")
+        password = getattr(config, "SKINPORT_PASSWORD", "")
 
-        logger.info("Skinport Observation : connexion au flux WebSocket saleFeed...")
+        if use_playwright:
+            from skinport_cf_bypass import SkinportPlaywrightIngestor
+            logger.info("Skinport Observation : mode Playwright (login=%s)...", bool(email and password))
+        else:
+            from skinport_ingestion import SkinportIngestor
+            logger.info("Skinport Observation : connexion au flux WebSocket saleFeed...")
 
         # Cache mémoire sale_id -> listing_data pour lookup O(1) lors du "sold"
         # (complément du stockage DB — survit aux courtes interruptions réseau)
@@ -1612,7 +1621,16 @@ class ObservationIngestor:
             )
             self.observer._db.delete_observed_listings([listing_id])
 
-        ingestor = SkinportIngestor(on_listed=on_listed, on_sold=on_sold)
+        if use_playwright:
+            ingestor = SkinportPlaywrightIngestor(
+                on_listed=on_listed,
+                on_sold=on_sold,
+                headless=getattr(config, "SKINPORT_PLAYWRIGHT_HEADLESS", True),
+                email=email,
+                password=password,
+            )
+        else:
+            ingestor = SkinportIngestor(on_listed=on_listed, on_sold=on_sold)
         await ingestor.start(session=session)
 
         try:

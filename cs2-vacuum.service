@@ -1,0 +1,14 @@
+[Unit]
+Description=CS2 SQLite VACUUM hebdomadaire
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/cs2-observation-bot
+ExecStart=/home/ubuntu/cs2-observation-bot/venv/bin/python3 -c "import sqlite3, os; db='/home/ubuntu/cs2-observation-bot/data/observer_dataset.db'; conn=sqlite3.connect(db); conn.execute('VACUUM'); conn.close(); print('VACUUM OK')"
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
