@@ -225,6 +225,27 @@ class ObservationIngestor:
                                     f"DMarket heartbeat — cycle {self._dmarket_cycle} | "
                                     f"listings suivis : {len(processed_listings)}"
                                 )
+                            # Nettoyage périodique pour éviter la fuite de mémoire et gérer les ré-insertions
+                            if self._dmarket_cycle % 300 == 0:
+                                try:
+                                    conn = self.observer._db._get_connection()
+                                    try:
+                                        cursor = conn.execute(
+                                            "SELECT listing_id FROM observed_listings WHERE platform = 'dmarket';"
+                                        )
+                                        db_ids = {row[0] for row in cursor.fetchall()}
+                                        processed_listings = {
+                                            lid: price for lid, price in processed_listings.items()
+                                            if lid in db_ids
+                                        }
+                                        logger.info(
+                                            f"DMarket cleanup — cache processed_listings nettoyé. "
+                                            f"Restants : {len(processed_listings)} listings."
+                                        )
+                                    finally:
+                                        conn.close()
+                                except Exception as e:
+                                    logger.error(f"Erreur lors du nettoyage de processed_listings : {e}")
 
                     elif response.status == 429:
                         retry_after = 30
