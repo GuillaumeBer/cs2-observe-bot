@@ -347,10 +347,8 @@ class ObservationIngestor:
                                             else:
                                                 category = "NORMAL_SALE"
 
-                                            try:
-                                                sticker_names = json.loads(item["sticker_names"])
-                                            except Exception:
-                                                sticker_names = []
+                                            sn = item.get("sticker_names")
+                                            sticker_names = sn if isinstance(sn, list) else []
 
                                             # P3 : confidence basée sur listed_at_source
                                             listed_at_source = item.get("listed_at_source")
@@ -519,10 +517,8 @@ class ObservationIngestor:
                                             else:
                                                 category = "NORMAL_SALE"
 
-                                            try:
-                                                sticker_names = json.loads(item["sticker_names"])
-                                            except Exception:
-                                                sticker_names = []
+                                            sn = item.get("sticker_names")
+                                            sticker_names = sn if isinstance(sn, list) else []
 
                                             logger.info(
                                                 f"MATCH RÉCONCILIÉ CSFloat: {skin_name} | "

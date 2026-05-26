@@ -203,10 +203,8 @@ async def reconcile_skin(session: aiohttp.ClientSession, market_hash_name: str) 
             listed_at_source = matched_listing.get("listed_at_source")
             confidence = "HIGH" if listed_at_source == "createdAt" else "MEDIUM"
 
-            try:
-                sticker_names = json.loads(matched_listing.get("sticker_names") or "[]")
-            except Exception:
-                sticker_names = []
+            sn = matched_listing.get("sticker_names")
+            sticker_names = sn if isinstance(sn, list) else []
 
             saved = db.save_transaction(
                 market_hash_name=market_hash_name,
