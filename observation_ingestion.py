@@ -203,6 +203,9 @@ class ObservationIngestor:
     async def _deferred_verification_loop(self, session: aiohttp.ClientSession) -> None:
         await asyncio.sleep(30)
 
+        import urllib.parse
+        import yarl
+
         while self.is_running:
             try:
                 start_time = time.perf_counter()
@@ -210,38 +213,32 @@ class ObservationIngestor:
 
                 self.observer._db.clean_old_observed_listings(config.OBSERVER_MAX_TTD_SEC)
 
-                pending = self.observer._db.get_pending_observed_listings("dmarket")
-                if not pending:
+                # Option A : récupérer uniquement la liste des skins distincts (pas tous les listings)
+                skin_names = self.observer._db.get_pending_observed_skin_names("dmarket")
+                if not skin_names:
                     logger.debug("Aucun listing DMarket en attente de réconciliation.")
                     await asyncio.sleep(120)
                     continue
 
-                by_skin = {}
-                for p in pending:
-                    by_skin.setdefault(p["market_hash_name"], []).append(p)
-
-                for s_name in by_skin:
-                    by_skin[s_name].sort(
-                        key=lambda x: x["listed_at"] if x.get("listed_at") is not None else datetime.fromisoformat(x["timestamp"].replace("Z", "+00:00")).timestamp(),
-                        reverse=True
-                    )
-
-                logger.info(f"Réconciliation de {len(pending)} listings en attente sur {len(by_skin)} skins différents...")
+                logger.info(f"Réconciliation DMarket : {len(skin_names)} skins avec listings actifs...")
 
                 matched_count = 0
-                import urllib.parse
-                import yarl
 
-                for skin_name, listings in by_skin.items():
+                for skin_name in skin_names:
                     if not self.is_running:
                         break
 
                     await asyncio.sleep(0.5)
 
+                    # Option A : charger uniquement les listings de ce skin (requête indexée)
+                    listings = self.observer._db.get_pending_observed_listings_for_skin("dmarket", skin_name)
+                    if not listings:
+                        continue
+
                     encoded_title = urllib.parse.quote(skin_name)
                     url_str = f"https://api.dmarket.com/trade-aggregator/v1/last-sales?title={encoded_title}&gameId=a8db&limit=50"
                     url = yarl.URL(url_str)
-                    
+
                     path = url.raw_path
                     if url.raw_query_string:
                         path += f"?{url.raw_query_string}"
@@ -258,7 +255,7 @@ class ObservationIngestor:
                             if response.status == 200:
                                 data = await response.json()
                                 sales = data.get("sales") or []
-                                
+
                                 server_date_str = response.headers.get("Date")
                                 if server_date_str:
                                     try:
@@ -270,7 +267,7 @@ class ObservationIngestor:
 
                                 if not sales:
                                     continue
-                                    
+
                                 for sale in sales:
                                     sale_price = 0.0
                                     raw_price = sale.get("price")
@@ -316,7 +313,7 @@ class ObservationIngestor:
 
                                         if item.get("listed_at") is not None:
                                             l_ts = float(item["listed_at"])
-                                            t_src = "createdAt"
+                                            t_src = item.get("listed_at_source") or "unknown"
                                         else:
                                             try:
                                                 listed_dt = datetime.fromisoformat(item["timestamp"].replace("Z", "+00:00"))
@@ -326,11 +323,9 @@ class ObservationIngestor:
                                             except Exception:
                                                 continue
 
-                                        # La mise en ligne doit précéder la vente (avec marge d'erreur de 1.5s pour le polling)
                                         if l_ts - 1.5 > sale_ts:
                                             continue
 
-                                        # Pas de TTD exagérément long pour éviter faux-positifs
                                         if sale_ts - l_ts > config.OBSERVER_MAX_TTD_SEC:
                                             continue
 
@@ -344,7 +339,7 @@ class ObservationIngestor:
                                         sale_sig = f"dmarket_deferred_{skin_name}_{sale_price:.2f}_{sale_ts:.3f}"
                                         if self._matched_sales_cache.add(sale_sig):
                                             ttd_ms = max(0.0, (sale_ts - listed_ts) * 1000)
-                                            
+
                                             if ttd_ms < config.OBS_BOT_SNIPE_TTD_MS:
                                                 category = "BOT_SNIPE"
                                             elif ttd_ms < config.OBS_FAST_HUMAN_TTD_MS:
@@ -357,16 +352,14 @@ class ObservationIngestor:
                                             except Exception:
                                                 sticker_names = []
 
-                                            confidence = "HIGH"
+                                            # P3 : confidence basée sur listed_at_source
+                                            listed_at_source = item.get("listed_at_source")
+                                            confidence = "HIGH" if listed_at_source == "createdAt" else "MEDIUM"
 
-                                            logger.info(
-                                                f"MATCH RÉCONCILIÉ DMarket: {skin_name} | "
-                                                f"Prix: ${item_price_usd:.2f} | "
-                                                f"TTD: {ttd_ms/1000:.1f}s [{ttd_source}] | "
-                                                f"Catégorie: {category} | Confidence: {confidence}"
-                                            )
+                                            item_price_usd = item["price_cents"] / 100.0
+                                            sale_ts_iso = datetime.fromtimestamp(sale_ts, timezone.utc).isoformat().replace("+00:00", "Z")
 
-                                            self.observer._db.save_transaction(
+                                            saved = self.observer._db.save_transaction(
                                                 market_hash_name=skin_name,
                                                 price_usd=item_price_usd,
                                                 ttd_ms=ttd_ms,
@@ -376,22 +369,27 @@ class ObservationIngestor:
                                                 paint_seed=item["paint_seed"],
                                                 sticker_count=item["sticker_count"],
                                                 sticker_names=sticker_names,
-                                                timestamp=datetime.fromtimestamp(sale_ts, timezone.utc).isoformat(),
+                                                timestamp=sale_ts_iso,
                                                 confidence=confidence,
                                             )
-                                            
-                                            # Au lieu de supprimer juste un listing_id, on supprime TOUTES les entrées de cet item
-                                            # antérieures à la date de vente (avec le delta d'erreur de 1.5s géré par la DB).
-                                            sale_ts_iso = datetime.fromtimestamp(sale_ts, timezone.utc).isoformat()
-                                            self.observer._db.delete_observed_listings_before_timestamp(
-                                                float_value=item["float_value"],
-                                                platform="dmarket",
-                                                max_timestamp_iso=sale_ts_iso
-                                            )
-                                            # On nettoie listings localement pour éviter d'autres reconciliations de ce float dans ce cycle
-                                            listings[:] = [l for l in listings if abs(l["float_value"] - item["float_value"]) >= 1e-5]
-                                            matched_count += 1
+
+                                            # P2 : log et nettoyage seulement si le save a réussi
+                                            if saved:
+                                                logger.info(
+                                                    f"MATCH RÉCONCILIÉ DMarket: {skin_name} | "
+                                                    f"Prix: ${item_price_usd:.2f} | "
+                                                    f"TTD: {ttd_ms/1000:.1f}s [{ttd_source}] | "
+                                                    f"Catégorie: {category} | Confidence: {confidence}"
+                                                )
+                                                self.observer._db.delete_observed_listings_before_timestamp(
+                                                    float_value=item["float_value"],
+                                                    platform="dmarket",
+                                                    max_timestamp_iso=sale_ts_iso
+                                                )
+                                                listings[:] = [l for l in listings if abs(l["float_value"] - item["float_value"]) >= 1e-5]
+                                                matched_count += 1
                                             break
+
                             elif response.status == 429:
                                 logger.warning("DMarket last-sales rate limited. Pause 10s.")
                                 await asyncio.sleep(10)

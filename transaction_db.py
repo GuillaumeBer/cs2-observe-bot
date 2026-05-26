@@ -601,6 +601,21 @@ class TransactionDatabase:
             conn.close()
         return results
 
+    def get_pending_observed_skin_names(self, platform: str) -> List[str]:
+        """Retourne les market_hash_name distincts ayant des listings actifs (is_target=1)."""
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT market_hash_name FROM observed_listings WHERE platform = ? AND is_target = 1;",
+                (platform,)
+            ).fetchall()
+            return [row[0] for row in rows]
+        except Exception as e:
+            logger.error(f"Erreur get_pending_observed_skin_names({platform}): {e}")
+            return []
+        finally:
+            conn.close()
+
     def get_pending_observed_listings_for_skin(self, platform: str, market_hash_name: str) -> List[dict]:
         """Retourne les listings observés actifs pour un skin précis (requête indexée)."""
         query = "SELECT * FROM observed_listings WHERE platform = ? AND market_hash_name = ? AND is_target = 1;"

@@ -230,7 +230,7 @@ async def main():
     ensure_indexes()
 
     # 0b. Supprimer les listings de plus de 100 jours (fenêtre glissante)
-    max_ttd_sec = float(os.getenv("OBSERVER_MAX_TTD_SEC", str(100 * 24 * 3600)))
+    max_ttd_sec = float(os.getenv("OBSERVER_MAX_TTD_SEC", str(14 * 24 * 3600)))
     deleted = db.clean_old_observed_listings(max_ttd_sec)
     logger.info(f"Fenêtre glissante 100j : {deleted} listings expirés supprimés.")
 
