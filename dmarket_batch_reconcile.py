@@ -47,8 +47,9 @@ def ensure_indexes():
     finally:
         conn.close()
 
-# Epsilon pour la comparaison des float (flottants SQLite et API DMarket)
-FLOAT_EPSILON = 1e-6
+# Epsilon pour la comparaison des float (flottants SQLite et API DMarket).
+# 1e-5 pour absorber les arrondis IEEE 754 tout en restant en dessous du seuil de collision réaliste.
+FLOAT_EPSILON = 1e-5
 
 async def fetch_last_sales(session: aiohttp.ClientSession, market_hash_name: str) -> list:
     """Interroge l'endpoint last-sales pour un skin donné."""
@@ -147,45 +148,51 @@ async def reconcile_skin(session: aiohttp.ClientSession, market_hash_name: str) 
         if not sale:
             continue
 
-        # Essayer de trouver un listing actif correspondant par float (avec epsilon)
-        matched_listing = None
-        for lst in listings:
-            if lst["float_value"] is not None:
-                if abs(lst["float_value"] - sale["float_value"]) < FLOAT_EPSILON:
-                    if abs(lst["price_cents"] / 100.0 - sale["price_usd"]) < 0.01:
-                        matched_listing = lst
-                        break
+        # Best-match : listing le plus proche temporellement de la vente (évite le biais first-match
+        # quand un même skin a été re-listé avec le même float).
+        best_match = None
+        best_listed_at = None
+        best_time_diff = float("inf")
 
-        if matched_listing:
-            # Calcul du TTD en millisecondes
-            # DMarket sale_date est un timestamp Unix (secondes), listed_at est en secondes
-            listed_at = matched_listing["listed_at"]
-            if not listed_at:
-                # Fallback sur le timestamp string au format ISO si listed_at n'est pas dispo
+        for lst in listings:
+            if lst["float_value"] is None:
+                continue
+            if abs(lst["float_value"] - sale["float_value"]) >= FLOAT_EPSILON:
+                continue
+            if abs(lst["price_cents"] / 100.0 - sale["price_usd"]) >= 0.01:
+                continue
+
+            lst_listed_at = lst["listed_at"]
+            if not lst_listed_at:
                 try:
-                    dt = datetime.fromisoformat(matched_listing["timestamp"].replace("Z", "+00:00"))
-                    listed_at = dt.timestamp()
+                    dt = datetime.fromisoformat(lst["timestamp"].replace("Z", "+00:00"))
+                    lst_listed_at = dt.timestamp()
                 except Exception:
                     continue
 
-            ttd_seconds = sale["sale_date"] - listed_at
-            
-            # Il est possible qu'il y ait des imprécisions d'horloges, mais le TTD doit rester positif.
-            # On tolère un léger décalage (ex: -5s) et on le remet à 0.
+            ttd_seconds_candidate = sale["sale_date"] - lst_listed_at
+            if ttd_seconds_candidate < -10:
+                continue  # listing postérieur à la vente : pas le bon
+
+            time_diff = abs(ttd_seconds_candidate)
+            if time_diff < best_time_diff:
+                best_time_diff = time_diff
+                best_match = lst
+                best_listed_at = lst_listed_at
+
+        if best_match:
+            matched_listing = best_match
+            ttd_seconds = sale["sale_date"] - best_listed_at
+
+            # Tolérance horloge : TTD légèrement négatif → remis à 0
             if ttd_seconds < 0:
-                if ttd_seconds > -10:
-                    ttd_seconds = 0
-                else:
-                    # Si le décalage est trop grand dans le négatif, ce n'est probablement pas le même listing (réutilisation de float)
-                    continue
+                ttd_seconds = 0
 
             ttd_ms = ttd_seconds * 1000.0
 
-            # Convertir timestamp Unix en format ISO string pour la table transactions
             sale_dt = datetime.fromtimestamp(sale["sale_date"], timezone.utc)
             sale_timestamp_str = sale_dt.isoformat().replace("+00:00", "Z")
 
-            # Catégorisation par vitesse de vente (cohérente avec observer._process_disappearance)
             if ttd_ms < config.OBS_BOT_SNIPE_TTD_MS:
                 category = "BOT_SNIPE"
             elif ttd_ms < config.OBS_FAST_HUMAN_TTD_MS:
@@ -193,11 +200,14 @@ async def reconcile_skin(session: aiohttp.ClientSession, market_hash_name: str) 
             else:
                 category = "NORMAL_SALE"
 
-            # Si listed_at vient de updatedAt (modif de prix), le TTD est potentiellement trop court
             listed_at_source = matched_listing.get("listed_at_source")
             confidence = "HIGH" if listed_at_source == "createdAt" else "MEDIUM"
 
-            # Enregistrer la transaction
+            try:
+                sticker_names = json.loads(matched_listing.get("sticker_names") or "[]")
+            except Exception:
+                sticker_names = []
+
             saved = db.save_transaction(
                 market_hash_name=market_hash_name,
                 price_usd=sale["price_usd"],
@@ -206,6 +216,8 @@ async def reconcile_skin(session: aiohttp.ClientSession, market_hash_name: str) 
                 category=category,
                 float_value=sale["float_value"],
                 paint_seed=sale["paint_seed"],
+                sticker_count=matched_listing.get("sticker_count", 0),
+                sticker_names=sticker_names,
                 timestamp=sale_timestamp_str,
                 confidence=confidence
             )
@@ -213,12 +225,10 @@ async def reconcile_skin(session: aiohttp.ClientSession, market_hash_name: str) 
             if saved:
                 logger.info(
                     f"Match réconcilié : {market_hash_name} (float: {sale['float_value']}) | "
-                    f"Prix : ${sale['price_usd']:.2f} | TTD : {ttd_seconds:.1f}s"
+                    f"Prix : ${sale['price_usd']:.2f} | TTD : {ttd_seconds:.1f}s | Confidence: {confidence}"
                 )
                 matches_found += 1
-                # Supprimer le listing de la base pour éviter les doublons
                 db.delete_observed_listings([matched_listing["listing_id"]])
-                # Retirer le listing de notre liste locale pour ne pas matcher une autre vente dessus
                 listings.remove(matched_listing)
 
     return matches_found
