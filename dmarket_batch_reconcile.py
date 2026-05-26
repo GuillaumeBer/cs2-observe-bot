@@ -193,6 +193,10 @@ async def reconcile_skin(session: aiohttp.ClientSession, market_hash_name: str) 
             else:
                 category = "NORMAL_SALE"
 
+            # Si listed_at vient de updatedAt (modif de prix), le TTD est potentiellement trop court
+            listed_at_source = matched_listing.get("listed_at_source")
+            confidence = "HIGH" if listed_at_source == "createdAt" else "MEDIUM"
+
             # Enregistrer la transaction
             saved = db.save_transaction(
                 market_hash_name=market_hash_name,
@@ -203,7 +207,7 @@ async def reconcile_skin(session: aiohttp.ClientSession, market_hash_name: str) 
                 float_value=sale["float_value"],
                 paint_seed=sale["paint_seed"],
                 timestamp=sale_timestamp_str,
-                confidence="HIGH"  # Méthode exacte et réconciliée
+                confidence=confidence
             )
 
             if saved:

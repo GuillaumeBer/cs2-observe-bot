@@ -169,6 +169,7 @@ class ObservationIngestor:
                                     sticker_names=norm.get("sticker_names", []),
                                     timestamp=datetime.now(timezone.utc).isoformat(),
                                     listed_at=norm.get("listed_at"),
+                                    listed_at_source=norm.get("listed_at_source"),
                                     is_target=is_tgt,
                                 )
                                 new_count += 1
@@ -588,7 +589,11 @@ class ObservationIngestor:
         offer_id = raw.get("offerId") or extra.get("offerId", "")
         item_id = raw.get("itemId", "")
 
-        raw_ts = raw.get("createdAt") or extra.get("createdAt") or raw.get("updatedAt") or extra.get("updatedAt")
+        raw_ts = raw.get("createdAt") or extra.get("createdAt")
+        listed_at_source = "createdAt" if raw_ts else None
+        if not raw_ts:
+            raw_ts = raw.get("updatedAt") or extra.get("updatedAt")
+            listed_at_source = "updatedAt" if raw_ts else None
         try:
             listed_at = float(raw_ts) if raw_ts is not None else None
         except (ValueError, TypeError):
@@ -632,6 +637,7 @@ class ObservationIngestor:
             "market_hash_name": raw.get("title", ""),
             "price": price_cents,
             "listed_at": listed_at,
+            "listed_at_source": listed_at_source,
             "float_value": float_value,
             "paint_seed": paint_seed,
             "sticker_count": len(stickers),

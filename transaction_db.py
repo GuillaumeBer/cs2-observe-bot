@@ -78,7 +78,8 @@ class TransactionDatabase:
             sticker_count INTEGER DEFAULT 0,
             sticker_names TEXT,
             platform TEXT NOT NULL,
-            is_target INTEGER NOT NULL DEFAULT 1  -- 1 = skin cible (800), 0 = hors-cible
+            is_target INTEGER NOT NULL DEFAULT 1,  -- 1 = skin cible (800), 0 = hors-cible
+            listed_at_source TEXT  -- 'createdAt' | 'updatedAt' | NULL
         );
         """
         query_stats = """
@@ -131,6 +132,10 @@ class TransactionDatabase:
                     pass
                 try:
                     conn.execute("ALTER TABLE observed_listings ADD COLUMN is_target INTEGER NOT NULL DEFAULT 1;")
+                except Exception:
+                    pass
+                try:
+                    conn.execute("ALTER TABLE observed_listings ADD COLUMN listed_at_source TEXT;")
                 except Exception:
                     pass
             logger.info("Base de données initialisée avec succès (tables: transactions, opportunities, observed_listings, skin_market_stats).")
@@ -522,6 +527,7 @@ class TransactionDatabase:
         sticker_names: Optional[List[str]] = None,
         timestamp: Optional[str] = None,
         listed_at: Optional[float] = None,
+        listed_at_source: Optional[str] = None,
         is_target: bool = True,
     ) -> bool:
         if timestamp is None:
@@ -530,8 +536,8 @@ class TransactionDatabase:
         query = """
         INSERT OR IGNORE INTO observed_listings (
             listing_id, timestamp, listed_at, market_hash_name, price_cents,
-            float_value, paint_seed, sticker_count, sticker_names, platform, is_target
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            float_value, paint_seed, sticker_count, sticker_names, platform, is_target, listed_at_source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         conn = self._get_connection()
         try:
@@ -558,6 +564,7 @@ class TransactionDatabase:
                         stickers_json,
                         platform,
                         1 if is_target else 0,
+                        listed_at_source,
                     ),
                 )
             return True
