@@ -449,7 +449,8 @@ class ObservationIngestor:
                                                 self.observer._db.delete_observed_listings_before_timestamp(
                                                     float_value=item["float_value"],
                                                     platform="dmarket",
-                                                    max_timestamp_iso=sale_ts_iso
+                                                    max_timestamp_iso=sale_ts_iso,
+                                                    market_hash_name=skin_name
                                                 )
                                                 listings[:] = [l for l in listings if abs(l["float_value"] - item["float_value"]) >= 1e-5]
                                                 matched_count += 1
@@ -614,7 +615,8 @@ class ObservationIngestor:
                                             self.observer._db.delete_observed_listings_before_timestamp(
                                                 float_value=item["float_value"],
                                                 platform="csfloat",
-                                                max_timestamp_iso=sale_ts_iso
+                                                max_timestamp_iso=sale_ts_iso,
+                                                market_hash_name=skin_name
                                             )
                                             # On nettoie listings localement
                                             listings[:] = [l for l in listings if abs(l["float_value"] - item["float_value"]) >= 1e-5]

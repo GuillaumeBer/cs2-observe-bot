@@ -707,42 +707,51 @@ class TransactionDatabase:
         finally:
             conn.close()
 
-    def delete_observed_listings_before_timestamp(self, float_value: float, platform: str, max_timestamp_iso: str) -> int:
+    def delete_observed_listings_before_timestamp(self, float_value: float, platform: str, max_timestamp_iso: str, market_hash_name: str = None) -> int:
         """
-        Supprime tous les listings observés d'un item (même float et plateforme) dont la date de mise en ligne
+        Supprime tous les listings observés d'un item (même float, plateforme et skin) dont la date de mise en ligne
         est inférieure ou égale à max_timestamp_iso (avec un delta d'erreur de 1.5s inclus).
         """
         if float_value is None or float_value <= 0:
             return 0
-        
-        # On calcule le timestamp UNIX à partir du ISO max_timestamp_iso, et on retire 1.5 sec par rapport au listed_at.
-        # Mais dans la base de données, la date peut être stockée en ISO (timestamp) ou UNIX (listed_at).
-        # On va donc convertir max_timestamp_iso en secondes UNIX :
+
         try:
             dt = datetime.fromisoformat(max_timestamp_iso.replace("Z", "+00:00"))
             max_unix = dt.timestamp()
         except Exception:
             max_unix = None
 
-        # On supprime :
-        # - Les entrées où listed_at (UNIX) <= max_unix + 1.5 (si listed_at existe)
-        # - OU les entrées où timestamp (ISO) <= max_timestamp_iso (avec 1.5s d'ajustement converti en ISO)
         if max_unix is not None:
             max_iso_adjusted = datetime.fromtimestamp(max_unix + 1.5, timezone.utc).isoformat()
-            query = """
-            DELETE FROM observed_listings 
-            WHERE float_value = ? 
-              AND platform = ? 
-              AND (
-                  (listed_at IS NOT NULL AND listed_at <= ?)
-                  OR 
-                  (listed_at IS NULL AND timestamp <= ?)
-              );
-            """
+            if market_hash_name:
+                query = """
+                DELETE FROM observed_listings
+                WHERE float_value = ?
+                  AND platform = ?
+                  AND market_hash_name = ?
+                  AND (
+                      (listed_at IS NOT NULL AND listed_at <= ?)
+                      OR
+                      (listed_at IS NULL AND timestamp <= ?)
+                  );
+                """
+                params = (float_value, platform, market_hash_name, max_unix + 1.5, max_iso_adjusted)
+            else:
+                query = """
+                DELETE FROM observed_listings
+                WHERE float_value = ?
+                  AND platform = ?
+                  AND (
+                      (listed_at IS NOT NULL AND listed_at <= ?)
+                      OR
+                      (listed_at IS NULL AND timestamp <= ?)
+                  );
+                """
+                params = (float_value, platform, max_unix + 1.5, max_iso_adjusted)
             conn = self._get_connection()
             try:
                 with conn:
-                    cursor = conn.execute(query, (float_value, platform, max_unix + 1.5, max_iso_adjusted))
+                    cursor = conn.execute(query, params)
                     return cursor.rowcount
             except Exception as e:
                 logger.error(f"Erreur delete_observed_listings_before_timestamp : {e}")
