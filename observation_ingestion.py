@@ -295,7 +295,7 @@ class ObservationIngestor:
                     if not self.is_running:
                         break
 
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
 
                     # Charger uniquement les listings hors-cible de ce skin (is_target=0)
                     listings = self.observer._db.get_pending_observed_listings_for_skin("dmarket", skin_name, is_target=False)

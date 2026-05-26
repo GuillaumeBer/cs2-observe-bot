@@ -624,14 +624,21 @@ class TransactionDatabase:
             conn.close()
         return results
 
-    def get_pending_observed_skin_names(self, platform: str) -> List[str]:
-        """Retourne les market_hash_name distincts hors-cible (is_target=0) ayant des listings actifs.
-        Utilisé par la boucle déférée qui couvre uniquement les skins non ciblés par le batch."""
+    def get_pending_observed_skin_names(self, platform: str, max_age_seconds: float = 7200.0) -> List[str]:
+        """Retourne les market_hash_name distincts hors-cible (is_target=0) ayant au moins un listing
+        récent (listed_at ou timestamp dans les max_age_seconds dernières secondes).
+        Le filtre de fraîcheur borne le pool à ~max_age_seconds/3600 × taux_accumulation skins,
+        évitant une croissance illimitée au fil du temps."""
+        import time as _time
+        cutoff_ts = _time.time() - max_age_seconds
+        cutoff_iso = datetime.fromtimestamp(cutoff_ts, timezone.utc).isoformat()
         conn = self._get_connection()
         try:
             rows = conn.execute(
-                "SELECT DISTINCT market_hash_name FROM observed_listings WHERE platform = ? AND is_target = 0;",
-                (platform,)
+                "SELECT DISTINCT market_hash_name FROM observed_listings "
+                "WHERE platform = ? AND is_target = 0 "
+                "AND ((listed_at IS NOT NULL AND listed_at > ?) OR (listed_at IS NULL AND timestamp > ?));",
+                (platform, cutoff_ts, cutoff_iso)
             ).fetchall()
             return [row[0] for row in rows]
         except Exception as e:
