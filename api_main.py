@@ -37,7 +37,23 @@ def get_db_connection() -> sqlite3.Connection:
 import subprocess
 import os
 import re
+import json
 from datetime import datetime, timezone
+
+# Chargement de la liste des 800 skins cibles au démarrage
+TARGET_SKINS: set = set()
+
+def _load_target_skins() -> None:
+    global TARGET_SKINS
+    path = os.path.join(os.path.dirname(config.OBSERVER_DB_PATH), "target_skins.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            TARGET_SKINS = set(json.load(f))
+        logger.info(f"target_skins.json chargé : {len(TARGET_SKINS)} skins cibles.")
+    except Exception as e:
+        logger.warning(f"Impossible de charger target_skins.json : {e}")
+
+_load_target_skins()
 
 @app.get("/")
 def read_root():
@@ -192,6 +208,7 @@ def get_transactions(
     platform: str = Query(default=None),
     speed: str = Query(default=None), # 'bot', 'quick', 'normal'
     confidence: str = Query(default=None), # 'HIGH', 'MEDIUM', 'LOW'
+    target: str = Query(default=None), # 'true' = liste 800, 'false' = hors liste
     sort_by: str = Query(default="timestamp"),
     sort_dir: str = Query(default="desc")
 ):
@@ -249,15 +266,25 @@ def get_transactions(
                 query += " AND confidence = ?"
                 params.append(confidence.upper())
 
+        if target == "true" and TARGET_SKINS:
+            placeholders = ",".join("?" * len(TARGET_SKINS))
+            query += f" AND market_hash_name IN ({placeholders})"
+            params.extend(list(TARGET_SKINS))
+        elif target == "false" and TARGET_SKINS:
+            placeholders = ",".join("?" * len(TARGET_SKINS))
+            query += f" AND market_hash_name NOT IN ({placeholders})"
+            params.extend(list(TARGET_SKINS))
+
         query += f" ORDER BY {db_sort_col} {db_sort_dir} LIMIT ? OFFSET ?;"
         params.extend([limit, offset])
-        
+
         cursor = conn.execute(query, params)
         transactions = []
         for row in cursor.fetchall():
             tx = dict(row)
+            tx["is_target"] = tx["market_hash_name"] in TARGET_SKINS
             transactions.append(tx)
-            
+
         return transactions
     except Exception as e:
         logger.error(f"Erreur lors de la récupération des transactions : {e}")
@@ -271,6 +298,7 @@ def get_top_items(
     platform: str = Query(default=None),
     speed: str = Query(default=None),
     confidence: str = Query(default=None),
+    target: str = Query(default=None), # 'true' = liste 800, 'false' = hors liste
 ):
     """Retourne la liste des items les plus fréquemment achetés avec filtrage optionnel par plateforme, vitesse et fiabilité."""
     conn = get_db_connection()
@@ -299,14 +327,23 @@ def get_top_items(
         if confidence and confidence.upper() in {"HIGH", "MEDIUM", "LOW"}:
             query += " AND confidence = ?"
             params.append(confidence.upper())
-            
+
+        if target == "true" and TARGET_SKINS:
+            placeholders = ",".join("?" * len(TARGET_SKINS))
+            query += f" AND market_hash_name IN ({placeholders})"
+            params.extend(list(TARGET_SKINS))
+        elif target == "false" and TARGET_SKINS:
+            placeholders = ",".join("?" * len(TARGET_SKINS))
+            query += f" AND market_hash_name NOT IN ({placeholders})"
+            params.extend(list(TARGET_SKINS))
+
         query += """
         GROUP BY market_hash_name
         ORDER BY snipes_count DESC
         LIMIT ?;
         """
         params.append(limit)
-        
+
         cursor = conn.execute(query, params)
         top_items = []
         for row in cursor.fetchall():
@@ -314,7 +351,8 @@ def get_top_items(
                 "market_hash_name": row["market_hash_name"],
                 "snipes_count": row["snipes_count"],
                 "avg_ttd_seconds": round(row["avg_ttd_seconds"], 2),
-                "avg_price_usd": round(row["avg_price_usd"], 2)
+                "avg_price_usd": round(row["avg_price_usd"], 2),
+                "is_target": row["market_hash_name"] in TARGET_SKINS,
             })
         return top_items
     except Exception as e:
