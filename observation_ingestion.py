@@ -352,7 +352,7 @@ class ObservationIngestor:
 
                                             # P3 : confidence basée sur listed_at_source
                                             listed_at_source = item.get("listed_at_source")
-                                            confidence = "HIGH" if listed_at_source == "createdAt" else "MEDIUM"
+                                            confidence = "HIGH" if listed_at_source in ("createdAt", "updatedAt") else "MEDIUM"
 
                                             item_price_usd = item["price_cents"] / 100.0
                                             sale_ts_iso = datetime.fromtimestamp(sale_ts, timezone.utc).isoformat().replace("+00:00", "Z")
@@ -583,11 +583,13 @@ class ObservationIngestor:
         offer_id = raw.get("offerId") or extra.get("offerId", "")
         item_id = raw.get("itemId", "")
 
-        raw_ts = raw.get("createdAt") or extra.get("createdAt")
-        listed_at_source = "createdAt" if raw_ts else None
+        # Priorité à updatedAt : mesure le temps depuis le dernier prix posté (= moment où
+        # l'opportunité de sniping est apparue). createdAt en fallback si jamais reprixé.
+        raw_ts = raw.get("updatedAt") or extra.get("updatedAt")
+        listed_at_source = "updatedAt" if raw_ts else None
         if not raw_ts:
-            raw_ts = raw.get("updatedAt") or extra.get("updatedAt")
-            listed_at_source = "updatedAt" if raw_ts else None
+            raw_ts = raw.get("createdAt") or extra.get("createdAt")
+            listed_at_source = "createdAt" if raw_ts else None
         try:
             listed_at = float(raw_ts) if raw_ts is not None else None
         except (ValueError, TypeError):

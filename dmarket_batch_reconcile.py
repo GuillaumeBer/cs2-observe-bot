@@ -201,7 +201,7 @@ async def reconcile_skin(session: aiohttp.ClientSession, market_hash_name: str) 
                 category = "NORMAL_SALE"
 
             listed_at_source = matched_listing.get("listed_at_source")
-            confidence = "HIGH" if listed_at_source == "createdAt" else "MEDIUM"
+            confidence = "HIGH" if listed_at_source in ("createdAt", "updatedAt") else "MEDIUM"
 
             sn = matched_listing.get("sticker_names")
             sticker_names = sn if isinstance(sn, list) else []
