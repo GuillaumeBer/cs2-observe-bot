@@ -149,8 +149,9 @@ async def reconcile_skin(session: aiohttp.ClientSession, market_hash_name: str, 
         for lst in listings:
             if lst["float_value"] is not None:
                 if abs(lst["float_value"] - sale["float_value"]) < FLOAT_EPSILON:
-                    matched_listing = lst
-                    break
+                    if abs(lst["price_cents"] / 100.0 - sale["price_usd"]) < 0.01:
+                        matched_listing = lst
+                        break
 
         if matched_listing:
             # Calcul du TTD en millisecondes
