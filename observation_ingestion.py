@@ -216,11 +216,11 @@ class ObservationIngestor:
                 # Option A : récupérer uniquement la liste des skins distincts (pas tous les listings)
                 skin_names = self.observer._db.get_pending_observed_skin_names("dmarket")
                 if not skin_names:
-                    logger.debug("Aucun listing DMarket en attente de réconciliation.")
+                    logger.debug("Aucun listing DMarket hors-cible en attente de réconciliation.")
                     await asyncio.sleep(120)
                     continue
 
-                logger.info(f"Réconciliation DMarket : {len(skin_names)} skins avec listings actifs...")
+                logger.info(f"Réconciliation DMarket (hors-cible) : {len(skin_names)} skins avec listings actifs...")
 
                 matched_count = 0
 
@@ -230,8 +230,8 @@ class ObservationIngestor:
 
                     await asyncio.sleep(0.5)
 
-                    # Option A : charger uniquement les listings de ce skin (requête indexée)
-                    listings = self.observer._db.get_pending_observed_listings_for_skin("dmarket", skin_name)
+                    # Charger uniquement les listings hors-cible de ce skin (is_target=0)
+                    listings = self.observer._db.get_pending_observed_listings_for_skin("dmarket", skin_name, is_target=False)
                     if not listings:
                         continue
 

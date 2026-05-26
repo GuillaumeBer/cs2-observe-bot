@@ -603,11 +603,12 @@ class TransactionDatabase:
         return results
 
     def get_pending_observed_skin_names(self, platform: str) -> List[str]:
-        """Retourne les market_hash_name distincts ayant des listings actifs (is_target=1)."""
+        """Retourne les market_hash_name distincts hors-cible (is_target=0) ayant des listings actifs.
+        Utilisé par la boucle déférée qui couvre uniquement les skins non ciblés par le batch."""
         conn = self._get_connection()
         try:
             rows = conn.execute(
-                "SELECT DISTINCT market_hash_name FROM observed_listings WHERE platform = ? AND is_target = 1;",
+                "SELECT DISTINCT market_hash_name FROM observed_listings WHERE platform = ? AND is_target = 0;",
                 (platform,)
             ).fetchall()
             return [row[0] for row in rows]
@@ -617,13 +618,14 @@ class TransactionDatabase:
         finally:
             conn.close()
 
-    def get_pending_observed_listings_for_skin(self, platform: str, market_hash_name: str) -> List[dict]:
-        """Retourne les listings observés actifs pour un skin précis (requête indexée)."""
-        query = "SELECT * FROM observed_listings WHERE platform = ? AND market_hash_name = ? AND is_target = 1;"
+    def get_pending_observed_listings_for_skin(self, platform: str, market_hash_name: str, is_target: bool = True) -> List[dict]:
+        """Retourne les listings observés actifs pour un skin précis (requête indexée).
+        is_target=True (défaut) pour les skins cibles (batch), False pour les skins hors-cible (boucle déférée)."""
+        query = "SELECT * FROM observed_listings WHERE platform = ? AND market_hash_name = ? AND is_target = ?;"
         conn = self._get_connection()
         results = []
         try:
-            cursor = conn.execute(query, (platform, market_hash_name))
+            cursor = conn.execute(query, (platform, market_hash_name, 1 if is_target else 0))
             for row in cursor.fetchall():
                 row_dict = dict(row)
                 try:
