@@ -536,6 +536,14 @@ class TransactionDatabase:
         conn = self._get_connection()
         try:
             with conn:
+                if not is_target and float_value is not None and float_value > 0:
+                    # Pour les items hors-cible, on ne maintient qu'un seul listing (le plus récent)
+                    # On supprime donc l'ancien listing avec le même float sur cette plateforme
+                    conn.execute(
+                        "DELETE FROM observed_listings WHERE float_value = ? AND platform = ? AND is_target = 0;",
+                        (float_value, platform)
+                    )
+
                 conn.execute(
                     query,
                     (
