@@ -301,33 +301,45 @@ class ObservationIngestor:
                                         except ValueError:
                                             sale_float = None
 
-                                    if not sale_float or sale_float <= 0:
-                                        continue
+                                    best_match = None
+                                    best_time_diff = float('inf')
 
                                     for item in list(listings):
                                         item_price_usd = item["price_cents"] / 100.0
                                         if abs(item_price_usd - sale_price) >= 0.01:
                                             continue
 
-                                        if item.get("listed_at") is not None:
-                                            listed_ts = float(item["listed_at"])
-                                            ttd_source = "createdAt"
-                                        else:
-                                            try:
-                                                listed_dt = datetime.fromisoformat(item["timestamp"].replace("Z", "+00:00"))
-                                                clock_offset = getattr(self, "_dmarket_clock_offset", 0.0)
-                                                listed_ts = listed_dt.timestamp() - clock_offset
-                                                ttd_source = "observation"
-                                            except Exception:
-                                                continue
-
-                                        if not (listed_ts - 10.0 <= sale_ts <= listed_ts + config.OBSERVER_MAX_TTD_SEC):
-                                            continue
-
                                         if sale_float is not None and item["float_value"] is not None:
                                             if abs(item["float_value"] - sale_float) >= 1e-5:
                                                 continue
 
+                                        if item.get("listed_at") is not None:
+                                            l_ts = float(item["listed_at"])
+                                            t_src = "createdAt"
+                                        else:
+                                            try:
+                                                listed_dt = datetime.fromisoformat(item["timestamp"].replace("Z", "+00:00"))
+                                                clock_offset = getattr(self, "_dmarket_clock_offset", 0.0)
+                                                l_ts = listed_dt.timestamp() - clock_offset
+                                                t_src = "observation"
+                                            except Exception:
+                                                continue
+
+                                        # La mise en ligne doit précéder la vente (avec marge d'erreur de 1.5s pour le polling)
+                                        if l_ts - 1.5 > sale_ts:
+                                            continue
+
+                                        # Pas de TTD exagérément long pour éviter faux-positifs
+                                        if sale_ts - l_ts > config.OBSERVER_MAX_TTD_SEC:
+                                            continue
+
+                                        time_diff = sale_ts - l_ts
+                                        if time_diff < best_time_diff:
+                                            best_time_diff = time_diff
+                                            best_match = (item, l_ts, t_src)
+
+                                    if best_match is not None:
+                                        item, listed_ts, ttd_source = best_match
                                         sale_sig = f"dmarket_deferred_{skin_name}_{sale_price:.2f}_{sale_ts:.3f}"
                                         if self._matched_sales_cache.add(sale_sig):
                                             ttd_ms = max(0.0, (sale_ts - listed_ts) * 1000)
@@ -367,8 +379,16 @@ class ObservationIngestor:
                                                 confidence=confidence,
                                             )
                                             
-                                            self.observer._db.delete_observed_listings([item["listing_id"]])
-                                            listings.remove(item)
+                                            # Au lieu de supprimer juste un listing_id, on supprime TOUTES les entrées de cet item
+                                            # antérieures à la date de vente (avec le delta d'erreur de 1.5s géré par la DB).
+                                            sale_ts_iso = datetime.fromtimestamp(sale_ts, timezone.utc).isoformat()
+                                            self.observer._db.delete_observed_listings_before_timestamp(
+                                                float_value=item["float_value"],
+                                                platform="dmarket",
+                                                max_timestamp_iso=sale_ts_iso
+                                            )
+                                            # On nettoie listings localement pour éviter d'autres reconciliations de ce float dans ce cycle
+                                            listings[:] = [l for l in listings if abs(l["float_value"] - item["float_value"]) >= 1e-5]
                                             matched_count += 1
                                             break
                             elif response.status == 429:
@@ -526,8 +546,16 @@ class ObservationIngestor:
                                                 confidence="HIGH",
                                             )
 
-                                            self.observer._db.delete_observed_listings([item["listing_id"]])
-                                            listings.remove(item)
+                                            # Au lieu de supprimer juste un listing_id, on supprime TOUTES les entrées de cet item
+                                            # antérieures à la date de vente (avec le delta d'erreur de 1.5s géré par la DB).
+                                            sale_ts_iso = datetime.fromtimestamp(sale_ts, timezone.utc).isoformat()
+                                            self.observer._db.delete_observed_listings_before_timestamp(
+                                                float_value=item["float_value"],
+                                                platform="csfloat",
+                                                max_timestamp_iso=sale_ts_iso
+                                            )
+                                            # On nettoie listings localement
+                                            listings[:] = [l for l in listings if abs(l["float_value"] - item["float_value"]) >= 1e-5]
                                             matched_count += 1
                                             break
                             elif response.status == 429:
