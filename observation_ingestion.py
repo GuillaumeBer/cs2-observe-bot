@@ -38,6 +38,28 @@ class ObservationIngestor:
         self._verification_queue = None
         self._dmarket_cycle = 0
         self._matched_sales_cache = FIFOUniqueCache(maxsize=200)
+        
+        # Charger les skins cibles
+        self.target_skins = set()
+        try:
+            import os
+            # target_skins.json est généralement dans le même dossier ou dans data
+            possible_paths = [
+                "target_skins.json",
+                "data/target_skins.json",
+                os.path.join(os.path.dirname(__file__), "target_skins.json"),
+                os.path.join(os.path.dirname(__file__), "data", "target_skins.json"),
+            ]
+            for p in possible_paths:
+                if os.path.exists(p):
+                    with open(p, "r", encoding="utf-8") as f:
+                        self.target_skins = set(json.load(f))
+                    logger.info(f"ObservationIngestor : {len(self.target_skins)} skins cibles chargés depuis {p}")
+                    break
+            if not self.target_skins:
+                logger.warning("ObservationIngestor : Aucun skin cible chargé dans target_skins (toutes les insertions seront traitées comme hors-cible ou is_target=True par défaut si le fichier manque ? Non, par défaut is_target=False si non trouvé dans la liste pour économiser l'espace, ou True par sécurité ? Choisissons False si la liste est chargée mais vide, ou True si aucun fichier n'existe du tout pour ne pas tout ignorer. Mettons is_target = (market_hash_name in self.target_skins) si la liste est non vide, sinon True)")
+        except Exception as e:
+            logger.error(f"Erreur lors du chargement de target_skins.json : {e}")
 
     async def start(self, session: aiohttp.ClientSession) -> None:
         self.is_running = True
@@ -135,6 +157,7 @@ class ObservationIngestor:
                                 if not norm.get("float_value") or norm["float_value"] <= 0:
                                     continue
 
+                                is_tgt = (norm["market_hash_name"] in self.target_skins) if self.target_skins else True
                                 self.observer._db.save_observed_listing(
                                     listing_id=listing_id,
                                     market_hash_name=norm["market_hash_name"],
@@ -146,6 +169,7 @@ class ObservationIngestor:
                                     sticker_names=norm.get("sticker_names", []),
                                     timestamp=datetime.now(timezone.utc).isoformat(),
                                     listed_at=norm.get("listed_at"),
+                                    is_target=is_tgt,
                                 )
                                 new_count += 1
 
@@ -635,6 +659,7 @@ class ObservationIngestor:
                                 if warmup:
                                     continue
 
+                                is_tgt = (norm["market_hash_name"] in self.target_skins) if self.target_skins else True
                                 self.observer._db.save_observed_listing(
                                     listing_id=listing_id,
                                     market_hash_name=norm["market_hash_name"],
@@ -646,6 +671,7 @@ class ObservationIngestor:
                                     sticker_names=norm.get("sticker_names", []),
                                     timestamp=datetime.now(timezone.utc).isoformat(),
                                     listed_at=norm.get("listed_at"),
+                                    is_target=is_tgt,
                                 )
                                 new_count += 1
 
@@ -1254,6 +1280,7 @@ class ObservationIngestor:
                 if not listing_id or not float_value or float_value <= 0:
                     continue
                 stickers = item_data.get("stickers") or []
+                is_tgt = (market_hash_name in self.target_skins) if self.target_skins else True
                 saved = self.observer._db.save_observed_listing(
                     listing_id=listing_id,
                     market_hash_name=market_hash_name,
@@ -1265,6 +1292,7 @@ class ObservationIngestor:
                     sticker_names=[s["name"] for s in stickers if isinstance(s, dict) and "name" in s],
                     timestamp=now_iso,
                     listed_at=None,
+                    is_target=is_tgt,
                 )
                 if saved:
                     new_count += 1
@@ -1503,6 +1531,7 @@ class ObservationIngestor:
 
             # Persister en DB pour survivre à un redémarrage du bot
             stickers = listing.get("stickers") or []
+            is_tgt = (listing["market_hash_name"] in self.target_skins) if self.target_skins else True
             saved = self.observer._db.save_observed_listing(
                 listing_id=listing_id,
                 market_hash_name=listing["market_hash_name"],
@@ -1514,6 +1543,7 @@ class ObservationIngestor:
                 sticker_names=[s["name"] for s in stickers if isinstance(s, dict) and "name" in s],
                 timestamp=listing["ingested_at"],
                 listed_at=None,
+                is_target=is_tgt,
             )
             if saved:
                 logger.debug(f"Skinport listed: {listing['market_hash_name']} (sale_id={sale_id})")
