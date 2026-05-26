@@ -575,6 +575,28 @@ class TransactionDatabase:
         finally:
             conn.close()
 
+    def update_observed_listing_price(
+        self,
+        listing_id: str,
+        price_cents: int,
+        listed_at: Optional[float] = None,
+        listed_at_source: Optional[str] = None,
+    ) -> bool:
+        """Met à jour le prix et listed_at d'un listing existant suite à un reprixage détecté."""
+        conn = self._get_connection()
+        try:
+            with conn:
+                cursor = conn.execute(
+                    "UPDATE observed_listings SET price_cents = ?, listed_at = ?, listed_at_source = ? WHERE listing_id = ?;",
+                    (price_cents, listed_at, listed_at_source, listing_id),
+                )
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Erreur update_observed_listing_price({listing_id}): {e}")
+            return False
+        finally:
+            conn.close()
+
     def get_pending_observed_listings(self, platform: str, only_targets: bool = True) -> List[dict]:
         """
         Retourne les listings observés pour une plateforme.

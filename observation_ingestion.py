@@ -122,7 +122,8 @@ class ObservationIngestor:
 
         logger.info(f"DMarket Observation : polling par date de création toutes les {poll_interval}s")
 
-        processed_ids = FIFOUniqueCache(maxsize=10000)
+        # Dict listing_id → price_cents. None = entrée warmup (pas en DB).
+        processed_listings: dict = {}
         warmup = True
 
         while self.is_running:
@@ -145,40 +146,71 @@ class ObservationIngestor:
                         page_items = data.get("objects", [])
 
                         new_count = 0
+                        repriced_count = 0
                         for item in page_items:
                             norm = self._normalize_dmarket(item)
                             if not norm:
                                 continue
 
                             listing_id = norm["id"]
-                            if processed_ids.add(listing_id):
-                                if warmup:
-                                    continue
-                                if not norm.get("float_value") or norm["float_value"] <= 0:
-                                    continue
+                            current_price = norm["price"]
 
-                                is_tgt = (norm["market_hash_name"] in self.target_skins) if self.target_skins else True
-                                self.observer._db.save_observed_listing(
-                                    listing_id=listing_id,
-                                    market_hash_name=norm["market_hash_name"],
-                                    price_cents=norm["price"],
-                                    platform="dmarket",
-                                    float_value=norm.get("float_value"),
-                                    paint_seed=norm.get("paint_seed"),
-                                    sticker_count=norm.get("sticker_count", 0),
-                                    sticker_names=norm.get("sticker_names", []),
-                                    timestamp=datetime.now(timezone.utc).isoformat(),
-                                    listed_at=norm.get("listed_at"),
-                                    listed_at_source=norm.get("listed_at_source"),
-                                    is_target=is_tgt,
-                                )
-                                new_count += 1
+                            if listing_id in processed_listings:
+                                existing_price = processed_listings[listing_id]
+                                if existing_price is None:
+                                    # Entrée warmup : pas en DB, ignorer même si reprixé
+                                    continue
+                                if existing_price != current_price:
+                                    # Reprixage confirmé (price_cents a changé) → update DB
+                                    processed_listings[listing_id] = current_price
+                                    updated = self.observer._db.update_observed_listing_price(
+                                        listing_id=listing_id,
+                                        price_cents=current_price,
+                                        listed_at=norm.get("listed_at"),
+                                        listed_at_source=norm.get("listed_at_source"),
+                                    )
+                                    if updated:
+                                        repriced_count += 1
+                                        logger.debug(
+                                            f"DMarket reprixage : {norm['market_hash_name']} "
+                                            f"{existing_price/100:.2f}$ → {current_price/100:.2f}$"
+                                        )
+                                # else: même prix, rien à faire
+                                continue
+
+                            if warmup:
+                                processed_listings[listing_id] = None  # sentinel : pas en DB
+                                continue
+
+                            if not norm.get("float_value") or norm["float_value"] <= 0:
+                                continue
+
+                            processed_listings[listing_id] = current_price
+                            is_tgt = (norm["market_hash_name"] in self.target_skins) if self.target_skins else True
+                            self.observer._db.save_observed_listing(
+                                listing_id=listing_id,
+                                market_hash_name=norm["market_hash_name"],
+                                price_cents=current_price,
+                                platform="dmarket",
+                                float_value=norm.get("float_value"),
+                                paint_seed=norm.get("paint_seed"),
+                                sticker_count=norm.get("sticker_count", 0),
+                                sticker_names=norm.get("sticker_names", []),
+                                timestamp=datetime.now(timezone.utc).isoformat(),
+                                listed_at=norm.get("listed_at"),
+                                listed_at_source=norm.get("listed_at_source"),
+                                is_target=is_tgt,
+                            )
+                            new_count += 1
 
                         if warmup:
                             logger.info(f"DMarket : {len(page_items)} IDs initialisés (warmup terminé).")
                             warmup = False
-                        elif new_count > 0:
-                            logger.debug(f"DMarket : {new_count} nouveaux listings enregistrés.")
+                        else:
+                            if new_count > 0:
+                                logger.debug(f"DMarket : {new_count} nouveaux listings enregistrés.")
+                            if repriced_count > 0:
+                                logger.debug(f"DMarket : {repriced_count} reprixages mis à jour.")
 
                     elif response.status == 429:
                         retry_after = 30
