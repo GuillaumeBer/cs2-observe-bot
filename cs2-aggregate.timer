@@ -1,0 +1,10 @@
+[Unit]
+Description=Timer agrégation skins hors-cible (chaque dimanche à 02h00 UTC)
+
+[Timer]
+OnCalendar=Sun 02:00:00
+Persistent=true
+Unit=cs2-aggregate.service
+
+[Install]
+WantedBy=timers.target

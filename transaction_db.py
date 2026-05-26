@@ -77,7 +77,27 @@ class TransactionDatabase:
             paint_seed INTEGER,
             sticker_count INTEGER DEFAULT 0,
             sticker_names TEXT,
-            platform TEXT NOT NULL
+            platform TEXT NOT NULL,
+            is_target INTEGER NOT NULL DEFAULT 1  -- 1 = skin cible (800), 0 = hors-cible
+        );
+        """
+        query_stats = """
+        CREATE TABLE IF NOT EXISTS skin_market_stats (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            week_label       TEXT    NOT NULL,   -- ex: '2026-W22'
+            market_hash_name TEXT    NOT NULL,
+            platform         TEXT    NOT NULL DEFAULT 'dmarket',
+            listing_count    INTEGER DEFAULT 0,  -- nb de listings distincts observés dans la semaine
+            avg_price_cents  REAL,
+            min_price_cents  INTEGER,
+            max_price_cents  INTEGER,
+            avg_float        REAL,
+            min_float        REAL,
+            max_float        REAL,
+            is_target        INTEGER DEFAULT 0,  -- 1 si dans les 800 cibles lors de l'agrégation
+            created_at       TEXT,
+            updated_at       TEXT,
+            UNIQUE (week_label, market_hash_name, platform)
         );
         """
         conn = self._get_connection()
@@ -86,12 +106,16 @@ class TransactionDatabase:
                 conn.execute(query_tx)
                 conn.execute(query_opp)
                 conn.execute(query_observed)
-                # Créer des index pour accélérer les requêtes fréquentes
+                conn.execute(query_stats)
+                # Index pour les requêtes fréquentes
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_name ON transactions (market_hash_name);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_name_float ON transactions (market_hash_name, float_value);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_opp_name ON opportunities (market_hash_name);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_name ON observed_listings (market_hash_name);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_platform ON observed_listings (platform);")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_listed_at ON observed_listings (listed_at);")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_week ON skin_market_stats (week_label);")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_skin ON skin_market_stats (market_hash_name);")
                 # Migrations pour BD existante
                 try:
                     conn.execute("ALTER TABLE transactions ADD COLUMN confidence TEXT NOT NULL DEFAULT 'LOW';")
@@ -105,7 +129,11 @@ class TransactionDatabase:
                     conn.execute("ALTER TABLE transactions ADD COLUMN ref_price_usd REAL;")
                 except Exception:
                     pass
-            logger.info("Base de données des transactions et opportunités initialisée avec succès.")
+                try:
+                    conn.execute("ALTER TABLE observed_listings ADD COLUMN is_target INTEGER NOT NULL DEFAULT 1;")
+                except Exception:
+                    pass
+            logger.info("Base de données initialisée avec succès (tables: transactions, opportunities, observed_listings, skin_market_stats).")
         except Exception as e:
             logger.error(f"Erreur d'initialisation de la base de données : {e}")
         finally:
@@ -494,6 +522,7 @@ class TransactionDatabase:
         sticker_names: Optional[List[str]] = None,
         timestamp: Optional[str] = None,
         listed_at: Optional[float] = None,
+        is_target: bool = True,
     ) -> bool:
         if timestamp is None:
             timestamp = datetime.now(timezone.utc).isoformat()
@@ -501,8 +530,8 @@ class TransactionDatabase:
         query = """
         INSERT OR IGNORE INTO observed_listings (
             listing_id, timestamp, listed_at, market_hash_name, price_cents,
-            float_value, paint_seed, sticker_count, sticker_names, platform
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            float_value, paint_seed, sticker_count, sticker_names, platform, is_target
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         conn = self._get_connection()
         try:
@@ -520,6 +549,7 @@ class TransactionDatabase:
                         sticker_count,
                         stickers_json,
                         platform,
+                        1 if is_target else 0,
                     ),
                 )
             return True
@@ -529,8 +559,16 @@ class TransactionDatabase:
         finally:
             conn.close()
 
-    def get_pending_observed_listings(self, platform: str) -> List[dict]:
-        query = "SELECT * FROM observed_listings WHERE platform = ?;"
+    def get_pending_observed_listings(self, platform: str, only_targets: bool = True) -> List[dict]:
+        """
+        Retourne les listings observés pour une plateforme.
+        only_targets=True (défaut) : ne retourne que les skins cibles (is_target=1)
+        pour la réconciliation. Passer False pour l'agrégation hors-cible.
+        """
+        if only_targets:
+            query = "SELECT * FROM observed_listings WHERE platform = ? AND is_target = 1;"
+        else:
+            query = "SELECT * FROM observed_listings WHERE platform = ? AND is_target = 0;"
         conn = self._get_connection()
         results = []
         try:
@@ -672,3 +710,105 @@ class TransactionDatabase:
         finally:
             conn.close()
         return count
+
+    # -------------------------------------------------------------------------
+    # skin_market_stats — Agrégation hebdomadaire des skins hors-cible
+    # -------------------------------------------------------------------------
+
+    def upsert_skin_market_stats(
+        self,
+        week_label: str,
+        market_hash_name: str,
+        platform: str,
+        listing_count: int,
+        avg_price_cents: float,
+        min_price_cents: int,
+        max_price_cents: int,
+        avg_float: Optional[float],
+        min_float: Optional[float],
+        max_float: Optional[float],
+        is_target: bool = False,
+    ) -> bool:
+        """
+        Insère ou met à jour les statistiques agrégées d'un skin pour une semaine donnée.
+        Idempotent : si la ligne (week_label, market_hash_name, platform) existe déjà,
+        elle est remplacée.
+        """
+        now_str = datetime.now(timezone.utc).isoformat()
+        query = """
+        INSERT INTO skin_market_stats (
+            week_label, market_hash_name, platform,
+            listing_count, avg_price_cents, min_price_cents, max_price_cents,
+            avg_float, min_float, max_float,
+            is_target, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (week_label, market_hash_name, platform)
+        DO UPDATE SET
+            listing_count   = excluded.listing_count,
+            avg_price_cents = excluded.avg_price_cents,
+            min_price_cents = excluded.min_price_cents,
+            max_price_cents = excluded.max_price_cents,
+            avg_float       = excluded.avg_float,
+            min_float       = excluded.min_float,
+            max_float       = excluded.max_float,
+            is_target       = excluded.is_target,
+            updated_at      = excluded.updated_at;
+        """
+        conn = self._get_connection()
+        try:
+            with conn:
+                conn.execute(query, (
+                    week_label, market_hash_name, platform,
+                    listing_count, avg_price_cents, min_price_cents, max_price_cents,
+                    avg_float, min_float, max_float,
+                    1 if is_target else 0,
+                    now_str, now_str,
+                ))
+            return True
+        except Exception as e:
+            logger.error(f"Erreur upsert skin_market_stats pour {market_hash_name} ({week_label}) : {e}")
+            return False
+        finally:
+            conn.close()
+
+    def get_skin_market_stats(
+        self,
+        week_label: Optional[str] = None,
+        is_target: Optional[bool] = None,
+        min_listings: int = 1,
+        order_by: str = "listing_count DESC",
+        limit: int = 200,
+    ) -> List[dict]:
+        """
+        Retourne les statistiques agrégées, optionnellement filtrées par semaine
+        et/ou par statut cible. Triées par défaut par volume décroissant.
+        """
+        conditions = ["listing_count >= ?"]
+        params: list = [min_listings]
+
+        if week_label:
+            conditions.append("week_label = ?")
+            params.append(week_label)
+        if is_target is not None:
+            conditions.append("is_target = ?")
+            params.append(1 if is_target else 0)
+
+        where = " AND ".join(conditions)
+        query = f"""
+        SELECT * FROM skin_market_stats
+        WHERE {where}
+        ORDER BY {order_by}
+        LIMIT ?;
+        """
+        params.append(limit)
+
+        conn = self._get_connection()
+        results = []
+        try:
+            cursor = conn.execute(query, params)
+            results = [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Erreur get_skin_market_stats : {e}")
+        finally:
+            conn.close()
+        return results

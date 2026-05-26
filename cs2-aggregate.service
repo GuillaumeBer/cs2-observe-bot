@@ -1,0 +1,14 @@
+[Unit]
+Description=CS2 Agrégation hebdomadaire des skins hors-cible
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/cs2-observation-bot
+ExecStart=/home/ubuntu/cs2-observation-bot/venv/bin/python3 /home/ubuntu/cs2-observation-bot/aggregate_non_target_stats.py
+EnvironmentFile=/home/ubuntu/cs2-observation-bot/.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
