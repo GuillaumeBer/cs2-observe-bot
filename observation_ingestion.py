@@ -161,13 +161,17 @@ class ObservationIngestor:
                                     # Entrée warmup : pas en DB, ignorer même si reprixé
                                     continue
                                 if existing_price != current_price:
-                                    # Reprixage confirmé (price_cents a changé) → update DB
+                                    # Reprixage confirmé (price_cents a changé) → update DB.
+                                    # L'API de polling ne renvoie pas updatedAt : on utilise
+                                    # time.time() comme listed_at (précis à ~1.5s, le poll interval).
                                     processed_listings[listing_id] = current_price
+                                    reprice_ts = norm.get("listed_at") if norm.get("listed_at_source") == "updatedAt" else time.time()
+                                    reprice_src = norm.get("listed_at_source") or "reprice_detected"
                                     updated = self.observer._db.update_observed_listing_price(
                                         listing_id=listing_id,
                                         price_cents=current_price,
-                                        listed_at=norm.get("listed_at"),
-                                        listed_at_source=norm.get("listed_at_source"),
+                                        listed_at=reprice_ts,
+                                        listed_at_source=reprice_src,
                                     )
                                     if updated:
                                         repriced_count += 1
@@ -384,7 +388,7 @@ class ObservationIngestor:
 
                                             # P3 : confidence basée sur listed_at_source
                                             listed_at_source = item.get("listed_at_source")
-                                            confidence = "HIGH" if listed_at_source in ("createdAt", "updatedAt") else "MEDIUM"
+                                            confidence = "HIGH" if listed_at_source in ("createdAt", "updatedAt", "reprice_detected") else "MEDIUM"
 
                                             item_price_usd = item["price_cents"] / 100.0
                                             sale_ts_iso = datetime.fromtimestamp(sale_ts, timezone.utc).isoformat().replace("+00:00", "Z")
