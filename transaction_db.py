@@ -594,6 +594,41 @@ class TransactionDatabase:
             conn.close()
         return results
 
+    def get_pending_observed_listings_for_skin(self, platform: str, market_hash_name: str) -> List[dict]:
+        """Retourne les listings observés actifs pour un skin précis (requête indexée)."""
+        query = "SELECT * FROM observed_listings WHERE platform = ? AND market_hash_name = ? AND is_target = 1;"
+        conn = self._get_connection()
+        results = []
+        try:
+            cursor = conn.execute(query, (platform, market_hash_name))
+            for row in cursor.fetchall():
+                row_dict = dict(row)
+                try:
+                    row_dict["sticker_names"] = json.loads(row_dict["sticker_names"])
+                except Exception:
+                    row_dict["sticker_names"] = []
+                results.append(row_dict)
+        except Exception as e:
+            logger.error(f"Erreur get_pending_observed_listings_for_skin({platform}, {market_hash_name}): {e}")
+        finally:
+            conn.close()
+        return results
+
+    def count_pending_observed_listings(self, platform: str) -> int:
+        """Retourne le nombre de listings observés actifs pour une plateforme (sans les charger)."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM observed_listings WHERE platform = ? AND is_target = 1;",
+                (platform,)
+            ).fetchone()
+            return row[0] if row else 0
+        except Exception as e:
+            logger.error(f"Erreur count_pending_observed_listings({platform}): {e}")
+            return 0
+        finally:
+            conn.close()
+
     def get_observed_listing_by_id(self, listing_id: str) -> Optional[dict]:
         """Retourne un listing observé par son listing_id, ou None s'il n'existe pas."""
         conn = self._get_connection()

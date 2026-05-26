@@ -32,15 +32,18 @@ db_path = os.getenv("OBSERVER_DB_PATH", os.path.join(config.BASE_DIR, "data", "o
 db = TransactionDatabase(db_path)
 
 
-def ensure_index_listed_at():
-    """Crée l'index listed_at si inexistant (idempotent, rapide)."""
+def ensure_indexes():
+    """Crée les index nécessaires si inexistants (idempotent, rapide)."""
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_obs_listed_at ON observed_listings (listed_at);"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_obs_platform_skin ON observed_listings (platform, market_hash_name);"
+        )
         conn.commit()
-        logger.info("Index idx_obs_listed_at vérifié/créé.")
+        logger.info("Index idx_obs_listed_at et idx_obs_platform_skin vérifiés/créés.")
     finally:
         conn.close()
 
@@ -126,14 +129,14 @@ def parse_sale_data(sale: dict) -> dict:
         "paint_seed": int(paint_seed) if paint_seed is not None else None
     }
 
-async def reconcile_skin(session: aiohttp.ClientSession, market_hash_name: str, active_listings: list) -> int:
+async def reconcile_skin(session: aiohttp.ClientSession, market_hash_name: str) -> int:
     """Récupère les ventes pour un skin, cherche les correspondances et met à jour la base."""
     sales = await fetch_last_sales(session, market_hash_name)
     if not sales:
         return 0
 
-    # Filtrer les listings actifs correspondants à ce skin
-    listings = [l for l in active_listings if l["market_hash_name"] == market_hash_name]
+    # Charger uniquement les listings de ce skin depuis la DB
+    listings = db.get_pending_observed_listings_for_skin("dmarket", market_hash_name)
     if not listings:
         return 0
 
@@ -219,8 +222,8 @@ async def reconcile_skin(session: aiohttp.ClientSession, market_hash_name: str, 
 async def main():
     logger.info("Démarrage de la réconciliation par lots (batch)...")
     
-    # 0. Créer/vérifier l'index listed_at pour les performances
-    ensure_index_listed_at()
+    # 0. Créer/vérifier les index pour les performances
+    ensure_indexes()
 
     # 0b. Supprimer les listings de plus de 100 jours (fenêtre glissante)
     max_ttd_sec = float(os.getenv("OBSERVER_MAX_TTD_SEC", str(100 * 24 * 3600)))
@@ -238,12 +241,11 @@ async def main():
         
     logger.info(f"Chargement de {len(target_skins)} skins cibles à analyser.")
 
-    # 2. Récupérer tous les listings observés actifs pour DMarket
-    # get_pending_observed_listings retourne tous les listings pour une plateforme
-    active_listings = db.get_pending_observed_listings("dmarket")
-    logger.info(f"{len(active_listings)} listings observés actifs en base.")
+    # 2. Vérifier qu'il y a bien des listings en base avant de commencer
+    active_count = db.count_pending_observed_listings("dmarket")
+    logger.info(f"{active_count} listings observés actifs en base.")
 
-    if not active_listings:
+    if active_count == 0:
         logger.info("Aucun listing actif en base, réconciliation annulée.")
         return
 
@@ -251,11 +253,11 @@ async def main():
     async with aiohttp.ClientSession() as session:
         total_matches = 0
         start_time = time.time()
-        
+
         for i, skin in enumerate(target_skins):
             loop_start = time.time()
-            
-            matches = await reconcile_skin(session, skin, active_listings)
+
+            matches = await reconcile_skin(session, skin)
             total_matches += matches
             
             # Rate limit : max 5 requêtes par seconde (intervalle de 0.2s minimum)
