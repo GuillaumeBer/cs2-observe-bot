@@ -118,8 +118,8 @@ def get_bot_status():
             log_dt = datetime.strptime(last_activity, "%Y-%m-%d %H:%M:%S")
             now_ts = datetime.now()
             diff_sec = (now_ts - log_dt).total_seconds()
-            # Si le bot tourne mais plus d'activité log depuis 120 secondes, suspicion de blocage
-            if diff_sec > 120:
+            # Si le bot tourne mais plus d'activité log depuis 300 secondes, suspicion de blocage
+            if diff_sec > 300:
                 status = "warning"
         except Exception:
             pass

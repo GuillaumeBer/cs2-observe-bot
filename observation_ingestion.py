@@ -213,10 +213,18 @@ class ObservationIngestor:
                             logger.info(f"DMarket : {len(page_items)} IDs initialisés (warmup terminé).")
                             warmup = False
                         else:
+                            self._dmarket_cycle += 1
+                            self.observer._poll_cycles += 1
                             if new_count > 0:
                                 logger.debug(f"DMarket : {new_count} nouveaux listings enregistrés.")
                             if repriced_count > 0:
                                 logger.debug(f"DMarket : {repriced_count} reprixages mis à jour.")
+                            # Heartbeat toutes les 60 cycles (~90s) pour maintenir le fichier log à jour
+                            if self._dmarket_cycle % 60 == 0:
+                                logger.info(
+                                    f"DMarket heartbeat — cycle {self._dmarket_cycle} | "
+                                    f"listings suivis : {len(processed_listings)}"
+                                )
 
                     elif response.status == 429:
                         retry_after = 30
