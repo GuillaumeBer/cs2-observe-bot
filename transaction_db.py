@@ -115,6 +115,7 @@ class TransactionDatabase:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_name ON observed_listings (market_hash_name);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_platform ON observed_listings (platform);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_listed_at ON observed_listings (listed_at);")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_platform_skin ON observed_listings (platform, market_hash_name);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_week ON skin_market_stats (week_label);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_skin ON skin_market_stats (market_hash_name);")
                 # Migrations pour BD existante
