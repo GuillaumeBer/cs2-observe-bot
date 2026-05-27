@@ -128,6 +128,7 @@ class WaxpeerIngestor:
         event_type = payload[0]
         if event_type == "removed":
             data = payload[1]
+            logger.debug(f"Waxpeer REMOVED payload: {json.dumps(data)}")
             if isinstance(data, dict):
                 item_id = str(data.get("item_id", ""))
                 if item_id and self.on_removed:
@@ -138,8 +139,13 @@ class WaxpeerIngestor:
                     })
             return
 
-        if event_type != "new":
+        if event_type == "new":
+            data = payload[1]
+            logger.debug(f"Waxpeer NEW payload keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+        else:
+            logger.info(f"Waxpeer événement inconnu '{event_type}': {json.dumps(payload[1] if len(payload) > 1 else {})}")
             return
+
         data = payload[1]
         if not isinstance(data, dict):
             return
