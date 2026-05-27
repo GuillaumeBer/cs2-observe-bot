@@ -1404,33 +1404,75 @@ class ObservationIngestor:
             price = listing.get("price", 0)
             if not (min_price_cents <= price <= max_price_cents):
                 return
+
+            lid = listing.get("id")
+            listed_at = listing.get("listed_at")
+            stickers = listing.get("item", {}).get("stickers", [])
+            sticker_names = [s["name"] for s in stickers]
+            is_tgt = (name in self.target_skins) if self.target_skins else True
+
+            # Mémoire : TTD en temps réel depuis l'événement WebSocket
             self.observer.record_addition({
-                "id": listing.get("id"),
-                "offer_id": listing.get("id").replace("waxpeer_", ""),
-                "market_hash_name": listing.get("market_hash_name"),
-                "price": listing.get("price"),
-                "listed_at": listing.get("listed_at"),
+                "id": lid,
+                "offer_id": lid.replace("waxpeer_", "") if lid else "",
+                "market_hash_name": name,
+                "price": price,
+                "listed_at": listed_at,
                 "float_value": fv,
                 "paint_seed": listing.get("item", {}).get("paint_seed"),
-                "sticker_count": len(listing.get("item", {}).get("stickers", [])),
-                "sticker_names": [s["name"] for s in listing.get("item", {}).get("stickers", [])],
+                "sticker_count": len(stickers),
+                "sticker_names": sticker_names,
             }, platform="waxpeer")
 
-        def on_removed(data: dict):
-            self.observer.record_removal(data["id"], platform="waxpeer", auto_confirm=True)
+            # DB : même structure que DMarket pour la réconciliation différée
+            self.observer._db.save_observed_listing(
+                listing_id=lid,
+                market_hash_name=name,
+                price_cents=price,
+                platform="waxpeer",
+                float_value=fv,
+                paint_seed=listing.get("item", {}).get("paint_seed"),
+                sticker_count=len(stickers),
+                sticker_names=sticker_names,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                listed_at=listed_at,
+                listed_at_source="waxpeer_new",
+                is_target=is_tgt,
+            )
 
         def on_updated(data: dict):
+            lid = data["id"]
+            new_price = data["price_cents"]
+            new_ts = data["listed_at"]
+
+            # Mémoire : TTD calculé depuis le dernier reprixage
+            if lid in self.observer._active_listings:
+                self.observer._active_listings[lid]["price_cents"] = new_price
+                self.observer._active_listings[lid]["first_seen_ts"] = new_ts
+                self.observer._active_listings[lid]["ttd_from_listing"] = True
+
+            # DB : même que reprice_detected DMarket → confidence HIGH
             updated = self.observer._db.update_observed_listing_price(
-                listing_id=data["id"],
-                price_cents=data["price_cents"],
-                listed_at=data["listed_at"],
+                listing_id=lid,
+                price_cents=new_price,
+                listed_at=new_ts,
                 listed_at_source="reprice_detected",
             )
             if updated:
                 logger.debug(
-                    f"Waxpeer reprixage : {data['id']} → {data['price_cents']/100:.2f}$ "
+                    f"Waxpeer reprixage : {lid} → {new_price/100:.2f}$ "
                     f"({'auto' if data.get('auto') else 'manuel'})"
                 )
+
+        def on_removed(data: dict):
+            lid = data["id"]
+            # Retire de la mémoire et enfile dans la file de vérification (comme DMarket)
+            entry = self.observer.record_removal(lid, platform="waxpeer", auto_confirm=False)
+            if entry:
+                entry["confidence"] = "MEDIUM" if entry.get("ttd_from_listing") else "LOW"
+                self._enqueue_candidates([entry], "waxpeer")
+            # Nettoyage DB immédiat (on sait exactement quand l'item a disparu)
+            self.observer._db.delete_observed_listings([lid])
 
         ingestor = WaxpeerIngestor(callback=on_new, on_removed=on_removed, on_updated=on_updated)
         await ingestor.start(session=session)
