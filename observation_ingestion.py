@@ -452,7 +452,14 @@ class ObservationIngestor:
                                                     max_timestamp_iso=sale_ts_iso,
                                                     market_hash_name=skin_name
                                                 )
-                                                listings[:] = [l for l in listings if abs(l["float_value"] - item["float_value"]) >= 1e-5]
+                                                listings[:] = [
+                                                    l for l in listings
+                                                    if l is not item and (
+                                                        l["float_value"] is None
+                                                        or item["float_value"] is None
+                                                        or abs(l["float_value"] - item["float_value"]) >= 1e-5
+                                                    )
+                                                ]
                                                 matched_count += 1
                                             break
 
@@ -462,7 +469,7 @@ class ObservationIngestor:
                             else:
                                 logger.warning(f"DMarket last-sales HTTP {response.status} pour {skin_name}")
                     except Exception as skin_err:
-                        logger.error(f"Erreur de réconciliation pour {skin_name} : {skin_err}")
+                        logger.error(f"Erreur de réconciliation pour {skin_name} : {skin_err}", exc_info=True)
 
                 elapsed = time.perf_counter() - start_time
                 logger.info(f"Fin de la boucle de réconciliation. {matched_count} ventes réconciliées en {elapsed:.1f}s.")
@@ -619,7 +626,14 @@ class ObservationIngestor:
                                                 market_hash_name=skin_name
                                             )
                                             # On nettoie listings localement
-                                            listings[:] = [l for l in listings if abs(l["float_value"] - item["float_value"]) >= 1e-5]
+                                            listings[:] = [
+                                                l for l in listings
+                                                if l is not item and (
+                                                    l["float_value"] is None
+                                                    or item["float_value"] is None
+                                                    or abs(l["float_value"] - item["float_value"]) >= 1e-5
+                                                )
+                                            ]
                                             matched_count += 1
                                             break
                             elif response.status == 429:
@@ -628,7 +642,7 @@ class ObservationIngestor:
                             else:
                                 logger.warning(f"CSFloat last-sales HTTP {response.status} pour {skin_name}")
                     except Exception as skin_err:
-                        logger.error(f"Erreur de réconciliation CSFloat pour {skin_name} : {skin_err}")
+                        logger.error(f"Erreur de réconciliation CSFloat pour {skin_name} : {skin_err}", exc_info=True)
 
                 elapsed = time.perf_counter() - start_time
                 logger.info(f"Fin de la boucle de réconciliation CSFloat. {matched_count} ventes réconciliées en {elapsed:.1f}s.")
