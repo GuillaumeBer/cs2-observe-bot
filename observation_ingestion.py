@@ -84,7 +84,7 @@ class ObservationIngestor:
         self._tasks: list = []
         self._verification_queue = None
         self._dmarket_cycle = 0
-        self._matched_sales_cache = FIFOUniqueCache(maxsize=200)
+        self._matched_sales_cache = FIFOUniqueCache(maxsize=1000)
         
         # Charger les skins cibles
         self.target_skins = set()
@@ -422,7 +422,7 @@ class ObservationIngestor:
                                             continue
 
                                         if sale_float is not None and item["float_value"] is not None:
-                                            if abs(item["float_value"] - sale_float) >= 1e-5:
+                                            if abs(item["float_value"] - sale_float) >= 1e-4:
                                                 continue
 
                                         if item.get("listed_at") is not None:
@@ -506,7 +506,7 @@ class ObservationIngestor:
                                                     if l is not item and (
                                                         l["float_value"] is None
                                                         or item["float_value"] is None
-                                                        or abs(l["float_value"] - item["float_value"]) >= 1e-5
+                                                        or abs(l["float_value"] - item["float_value"]) >= 1e-4
                                                     )
                                                 ]
                                                 matched_count += 1
@@ -627,7 +627,7 @@ class ObservationIngestor:
                                         if not (listed_ts - 10.0 <= sale_ts <= listed_ts + config.OBSERVER_MAX_TTD_SEC):
                                             continue
 
-                                        if abs(item["float_value"] - sale_float) >= 1e-5:
+                                        if abs(item["float_value"] - sale_float) >= 1e-4:
                                             continue
 
                                         sale_sig = f"csfloat_deferred_{skin_name}_{sale_price:.2f}_{sale_ts:.3f}"
@@ -680,7 +680,7 @@ class ObservationIngestor:
                                                 if l is not item and (
                                                     l["float_value"] is None
                                                     or item["float_value"] is None
-                                                    or abs(l["float_value"] - item["float_value"]) >= 1e-5
+                                                    or abs(l["float_value"] - item["float_value"]) >= 1e-4
                                                 )
                                             ]
                                             matched_count += 1

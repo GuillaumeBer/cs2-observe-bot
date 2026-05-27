@@ -845,7 +845,7 @@ class TransactionDatabase:
                         ttd_ms,
                         "EXPIRED",
                         r["platform"],
-                        "HIGH",
+                        "LOW",
                         ref_price_usd,
                     ))
                     saved_count += 1

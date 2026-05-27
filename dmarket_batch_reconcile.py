@@ -48,8 +48,8 @@ def ensure_indexes():
         conn.close()
 
 # Epsilon pour la comparaison des float (flottants SQLite et API DMarket).
-# 1e-5 pour absorber les arrondis IEEE 754 tout en restant en dessous du seuil de collision réaliste.
-FLOAT_EPSILON = 1e-5
+# 1e-4 pour absorber les différences de sérialisation entre l'API listing et l'API last-sales.
+FLOAT_EPSILON = 1e-4
 
 async def fetch_last_sales(session: aiohttp.ClientSession, market_hash_name: str) -> list:
     """Interroge l'endpoint last-sales pour un skin donné."""
