@@ -16,9 +16,15 @@ def _ws_url() -> str:
 
 
 class WaxpeerIngestor:
-    def __init__(self, callback: Callable[[dict], None], on_removed: Optional[Callable[[dict], None]] = None):
+    def __init__(
+        self,
+        callback: Callable[[dict], None],
+        on_removed: Optional[Callable[[dict], None]] = None,
+        on_updated: Optional[Callable[[dict], None]] = None,
+    ):
         self.callback = callback
         self.on_removed = on_removed
+        self.on_updated = on_updated
         self.is_running = False
         self._processed_ids = FIFOUniqueCache(maxsize=2000)
         self._loop_task: Optional[asyncio.Task] = None
@@ -126,9 +132,13 @@ class WaxpeerIngestor:
             return
 
         event_type = payload[0]
+
+        # Événements système attendus — pas d'action
+        if event_type in ("handshake", "subscribed"):
+            return
+
         if event_type == "removed":
             data = payload[1]
-            logger.debug(f"Waxpeer REMOVED payload: {json.dumps(data)}")
             if isinstance(data, dict):
                 item_id = str(data.get("item_id", ""))
                 if item_id and self.on_removed:
@@ -139,11 +149,24 @@ class WaxpeerIngestor:
                     })
             return
 
-        if event_type == "new":
+        if event_type == "update":
+            # Reprixage : même item_id, nouveau prix
             data = payload[1]
-            logger.debug(f"Waxpeer NEW payload keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
-        else:
-            logger.info(f"Waxpeer événement inconnu '{event_type}': {json.dumps(payload[1] if len(payload) > 1 else {})}")
+            if isinstance(data, dict) and data.get("game") == "csgo":
+                item_id = str(data.get("item_id", ""))
+                price_raw = data.get("price", 0)
+                price_cents = round(price_raw / 10)
+                if item_id and price_cents > 0 and self.on_updated:
+                    self.on_updated({
+                        "id": f"waxpeer_{item_id}",
+                        "price_cents": price_cents,
+                        "listed_at": time.time(),
+                        "auto": data.get("auto", True),
+                    })
+            return
+
+        if event_type != "new":
+            logger.debug(f"Waxpeer événement non géré: '{event_type}'")
             return
 
         data = payload[1]

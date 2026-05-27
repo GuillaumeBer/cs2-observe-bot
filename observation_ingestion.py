@@ -1187,15 +1187,15 @@ class ObservationIngestor:
         if not name or not price_cents:
             return 400, True
 
-        url = "https://api.waxpeer.com/v1/history"
-        params = {"api": config.WAXPEER_API_KEY}
+        url = "https://api.waxpeer.com/v1/sales-history"
+        params = {"api": config.WAXPEER_API_KEY, "game": "csgo"}
         headers = {"User-Agent": "Mozilla/5.0"}
 
         try:
             async with session.get(url, params=params, headers=headers, timeout=5) as response:
                 if response.status == 200:
                     body = await response.json()
-                    sales = body.get("history", [])
+                    sales = body.get("items", [])
 
                     server_date_str = response.headers.get("Date")
                     clock_offset = 0.0
@@ -1216,9 +1216,10 @@ class ObservationIngestor:
                         if sale_name != name:
                             continue
                         
+                        # sales-history: price en unités Waxpeer (1000 = $1)
                         sale_price = float(sale.get("price", 0)) / 1000.0
-                        
-                        raw_date = sale.get("created")
+
+                        raw_date = sale.get("date") or sale.get("created")
                         if not raw_date:
                             continue
                         try:
@@ -1409,7 +1410,20 @@ class ObservationIngestor:
         def on_removed(data: dict):
             self.observer.record_removal(data["id"], platform="waxpeer", auto_confirm=True)
 
-        ingestor = WaxpeerIngestor(callback=on_new, on_removed=on_removed)
+        def on_updated(data: dict):
+            updated = self.observer._db.update_observed_listing_price(
+                listing_id=data["id"],
+                price_cents=data["price_cents"],
+                listed_at=data["listed_at"],
+                listed_at_source="reprice_detected",
+            )
+            if updated:
+                logger.debug(
+                    f"Waxpeer reprixage : {data['id']} → {data['price_cents']/100:.2f}$ "
+                    f"({'auto' if data.get('auto') else 'manuel'})"
+                )
+
+        ingestor = WaxpeerIngestor(callback=on_new, on_removed=on_removed, on_updated=on_updated)
         await ingestor.start(session=session)
         
         try:
