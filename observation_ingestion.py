@@ -1391,9 +1391,18 @@ class ObservationIngestor:
 
         logger.info("Waxpeer Observation : abonné au flux WebSocket...")
 
+        min_price_cents = int(config.MIN_PRICE_USD * 100)
+        max_price_cents = int(config.MAX_PRICE_USD * 100)
+
         def on_new(listing: dict):
+            name = listing.get("market_hash_name", "")
+            if self.target_skins and name not in self.target_skins:
+                return
             fv = listing.get("item", {}).get("float_value")
             if not fv or fv <= 0:
+                return
+            price = listing.get("price", 0)
+            if not (min_price_cents <= price <= max_price_cents):
                 return
             self.observer.record_addition({
                 "id": listing.get("id"),
