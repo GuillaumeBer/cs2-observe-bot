@@ -193,6 +193,7 @@ class TransactionDatabase:
         sticker_names: Optional[List[str]] = None,
         timestamp: Optional[str] = None,
         confidence: str = "LOW",
+        ref_price_usd: Optional[float] = None,
     ) -> bool:
         """
         Enregistre une transaction détectée dans la base de données.
@@ -206,7 +207,8 @@ class TransactionDatabase:
         if not float_value or float_value <= 0:
             return False
 
-        ref_price_usd = self._compute_ref_price(market_hash_name, before_timestamp=timestamp)
+        if ref_price_usd is None:
+            ref_price_usd = self._compute_ref_price(market_hash_name, before_timestamp=timestamp)
 
         # 1. Vérification anti-empoisonnement par float identique récent
         if float_value is not None and float_value > 0:

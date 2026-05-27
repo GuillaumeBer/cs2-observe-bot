@@ -24,6 +24,53 @@ logger = logging.getLogger("cs2_sniper.observation_ingestion")
 LIVE_DISPLAY_INTERVAL_SEC = 30
 
 
+def _compute_ref_price_from_sales(sales: list, now_ts: float) -> Optional[float]:
+    """
+    Calcule le ref_price à partir des ventes retournées par l'API last-sales DMarket.
+    Fenêtre temporelle adaptative selon la liquidité du skin :
+      - >= 15 ventes dans les 2 derniers jours  → fenêtre 2j
+      - >=  5 ventes dans les 5 derniers jours  → fenêtre 5j
+      - sinon                                   → fenêtre 10j
+    Retourne None si moins de 3 ventes dans la fenêtre.
+    """
+    DAY = 86400.0
+
+    parsed = []
+    for sale in sales:
+        raw = sale.get("price")
+        try:
+            if isinstance(raw, str):
+                p = float(raw)
+            elif isinstance(raw, dict):
+                amt = raw.get("amount") or raw.get("USD") or 0
+                p = float(amt) if "." in str(amt) else float(amt) / 100.0
+            else:
+                continue
+        except (ValueError, TypeError):
+            continue
+        try:
+            ts = float(sale.get("date", 0))
+        except (ValueError, TypeError):
+            continue
+        if p > 0 and ts > 0:
+            parsed.append((ts, p))
+
+    if not parsed:
+        return None
+
+    n_2d = sum(1 for ts, _ in parsed if now_ts - ts < 2 * DAY)
+    n_5d = sum(1 for ts, _ in parsed if now_ts - ts < 5 * DAY)
+    window = 2 * DAY if n_2d >= 15 else (5 * DAY if n_5d >= 5 else 10 * DAY)
+
+    prices = [p for ts, p in parsed if now_ts - ts < window]
+    if len(prices) < 3:
+        return None
+
+    prices.sort()
+    n = len(prices)
+    return prices[n // 2] if n % 2 else (prices[n // 2 - 1] + prices[n // 2]) / 2.0
+
+
 class ObservationIngestor:
     """
     Ingesteur de snapshots complets pour le mode Observation.
@@ -423,6 +470,7 @@ class ObservationIngestor:
 
                                             item_price_usd = item["price_cents"] / 100.0
                                             sale_ts_iso = datetime.fromtimestamp(sale_ts, timezone.utc).isoformat().replace("+00:00", "Z")
+                                            ref_price = _compute_ref_price_from_sales(sales, time.time())
 
                                             saved = self.observer._db.save_transaction(
                                                 market_hash_name=skin_name,
@@ -436,6 +484,7 @@ class ObservationIngestor:
                                                 sticker_names=sticker_names,
                                                 timestamp=sale_ts_iso,
                                                 confidence=confidence,
+                                                ref_price_usd=ref_price,
                                             )
 
                                             # P2 : log et nettoyage seulement si le save a réussi
