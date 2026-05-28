@@ -1003,14 +1003,12 @@ class TransactionDatabase:
         conn = self._get_connection()
         try:
             with conn:
-                before = conn.execute("SELECT COUNT(*) FROM marketplace_sales").fetchone()[0]
-                conn.executemany("""
+                cursor = conn.executemany("""
                     INSERT OR IGNORE INTO marketplace_sales
                         (platform, market_hash_name, float_value, price_usd, sale_ts, fetched_at)
                     VALUES (?, ?, ?, ?, ?, ?)
                 """, records)
-                after = conn.execute("SELECT COUNT(*) FROM marketplace_sales").fetchone()[0]
-            return after - before
+            return cursor.rowcount
         except Exception as e:
             logger.error(f"Erreur insert_marketplace_sales: {e}")
             return 0
@@ -1092,8 +1090,9 @@ class TransactionDatabase:
                     confidence="HIGH",
                     ref_price_usd=ref_price,
                 )
+                # Toujours supprimer la vente de marketplace_sales (évite accumulation)
+                sale_ids_to_delete.append((row["sale_id"],))
                 if saved:
-                    sale_ids_to_delete.append((row["sale_id"],))
                     listing_ids_to_delete.append((row["listing_id"],))
                     matched += 1
 
@@ -1109,8 +1108,8 @@ class TransactionDatabase:
         return matched
 
     def _ttd_category(self, ttd_ms: float) -> str:
-        bot_ms = getattr(__import__("config"), "OBS_BOT_SNIPE_TTD_MS", 5000)
-        fast_ms = getattr(__import__("config"), "OBS_FAST_HUMAN_TTD_MS", 60000)
+        bot_ms = getattr(config, "OBS_BOT_SNIPE_TTD_MS", 5000)
+        fast_ms = getattr(config, "OBS_FAST_HUMAN_TTD_MS", 60000)
         if ttd_ms < bot_ms:
             return "BOT_SNIPE"
         if ttd_ms < fast_ms:
