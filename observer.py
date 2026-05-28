@@ -583,6 +583,38 @@ class MarketObserver:
             f"Double-vérif : {len(self._under_verification)} | "
             f"Hot items : {len(self._hot_items)}"
         )
+
+        # Stats par plateforme depuis la DB
+        try:
+            conn = self._db._get_connection()
+            try:
+                listings = conn.execute("""
+                    SELECT platform, COUNT(*) as n
+                    FROM observed_listings GROUP BY platform
+                """).fetchall()
+                sales = conn.execute("""
+                    SELECT platform, COUNT(*) as n
+                    FROM marketplace_sales GROUP BY platform
+                """).fetchall()
+                transactions = conn.execute("""
+                    SELECT platform, COUNT(*) as n
+                    FROM transactions WHERE confidence='HIGH' GROUP BY platform
+                """).fetchall()
+                listings_by_plat = {r[0]: r[1] for r in listings}
+                sales_by_plat = {r[0]: r[1] for r in sales}
+                tx_by_plat = {r[0]: r[1] for r in transactions}
+                all_platforms = sorted(set(list(listings_by_plat) + list(sales_by_plat)))
+                print("─" * 74)
+                for plat in all_platforms:
+                    l = listings_by_plat.get(plat, 0)
+                    s = sales_by_plat.get(plat, 0)
+                    t = tx_by_plat.get(plat, 0)
+                    print(f"   {plat.upper():<10} Listings: {l:>6} | Ventes brutes: {s:>7} | Transactions HIGH: {t:>5}")
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
         print("═" * 74 + "\n")
 
     # ──────────────────────────────────────────────────────────────────────────
