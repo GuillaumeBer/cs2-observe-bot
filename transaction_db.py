@@ -1046,7 +1046,8 @@ class TransactionDatabase:
                     s.sale_ts,
                     l.original_listed_at,
                     l.listed_at,
-                    (s.sale_ts - l.listed_at) * 1000 AS ttd_ms,
+                    COALESCE(l.listed_at, l.original_listed_at) AS effective_listed_at,
+                    (s.sale_ts - COALESCE(l.listed_at, l.original_listed_at)) * 1000 AS ttd_ms,
                     l.platform,
                     l.paint_seed,
                     l.sticker_count,
@@ -1059,6 +1060,7 @@ class TransactionDatabase:
                     AND l.original_listed_at IS NOT NULL
                     AND l.original_listed_at < s.sale_ts
                     AND l.original_listed_at > s.sale_ts - ?
+                    AND COALESCE(l.listed_at, l.original_listed_at) <= s.sale_ts
                     AND l.original_listed_at = (
                         SELECT MAX(l2.original_listed_at)
                         FROM observed_listings l2
@@ -1083,14 +1085,19 @@ class TransactionDatabase:
                     sticker_names = []
 
                 sale_ts_iso = datetime.fromtimestamp(row["sale_ts"], timezone.utc).isoformat()
-                listed_at_iso = datetime.fromtimestamp(row["listed_at"], timezone.utc).isoformat() if row["listed_at"] else "N/A"
-                original_listed_at_iso = datetime.fromtimestamp(row["original_listed_at"], timezone.utc).isoformat() if row["original_listed_at"] else "N/A"
+                effective_listed_at_iso = datetime.fromtimestamp(row["effective_listed_at"], timezone.utc).isoformat() if row["effective_listed_at"] else "N/A"
+                listed_at_source = "listed_at" if row["listed_at"] else "original_listed_at(fallback)"
+
+                if not row["listed_at"]:
+                    logger.warning(
+                        f"MATCH {row['platform'].upper()}: listed_at NULL pour {row['market_hash_name']} "
+                        f"(float={row['float_value']:.6f}) — fallback sur original_listed_at pour TTD"
+                    )
 
                 logger.info(
                     f"MATCH {row['platform'].upper()}: {row['market_hash_name']} | "
                     f"float={row['float_value']:.6f} | prix=${row['price_usd']:.2f} | "
-                    f"listed_at(dernier prix)={listed_at_iso} | "
-                    f"original_listed_at={original_listed_at_iso} | "
+                    f"effective_listed_at={effective_listed_at_iso} [{listed_at_source}] | "
                     f"sale_ts={sale_ts_iso} | "
                     f"TTD={ttd_ms/1000:.1f}s [{self._ttd_category(ttd_ms)}]"
                 )

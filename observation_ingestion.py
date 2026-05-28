@@ -212,14 +212,11 @@ class ObservationIngestor:
                                     # Entrée warmup : pas en DB, ignorer même si reprixé
                                     continue
                                 if existing_price != current_price:
-                                    # Reprixage confirmé (price_cents a changé) → update DB.
-                                    # L'API de polling ne renvoie pas updatedAt : on utilise
-                                    # time.time() comme listed_at (précis à ~1.5s, le poll interval).
+                                    # Reprixage confirmé : utiliser updatedAt de l'API (dans norm["listed_at"])
+                                    # qui est plus précis que time.time(). Fallback sur time.time() si absent.
                                     processed_listings[listing_id] = current_price
-                                    # L'API de polling ne retourne jamais updatedAt : time.time() est
-                                    # toujours la meilleure approximation du moment du reprixage (~1.5s).
-                                    reprice_ts = time.time()
-                                    reprice_src = "reprice_detected"
+                                    reprice_ts = norm.get("listed_at") or time.time()
+                                    reprice_src = norm.get("listed_at_source") or "reprice_detected"
                                     updated = self.observer._db.update_observed_listing_price(
                                         listing_id=listing_id,
                                         price_cents=current_price,
