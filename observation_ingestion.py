@@ -1448,9 +1448,8 @@ class ObservationIngestor:
             new_price = data["price_cents"]
             new_ts = data["listed_at"]
             if lid in self.observer._active_listings:
+                # Mise à jour du prix uniquement — first_seen_ts conservé pour TTD correct
                 self.observer._active_listings[lid]["price_cents"] = new_price
-                self.observer._active_listings[lid]["first_seen_ts"] = new_ts
-                self.observer._active_listings[lid]["ttd_from_listing"] = True
             # original_listed_at NON mis à jour — seulement price_cents et listed_at
             self.observer._db.update_observed_listing_price(
                 listing_id=lid,
@@ -1460,10 +1459,12 @@ class ObservationIngestor:
             )
 
         def on_removed(data: dict):
-            # Supprimer du listing DB — la réconciliation horaire confirme si c'est une vente
+            # NE PAS supprimer de observed_listings ici : la réconciliation horaire a besoin
+            # du listing pour matcher la vente dans marketplace_sales. Si on supprime
+            # maintenant, la vente collectée ~1h plus tard ne trouvera plus le listing.
+            # Le cleanup 7j et la réconciliation elle-même gèrent la suppression.
             lid = data["id"]
             self.observer._active_listings.pop(lid, None)
-            self.observer._db.delete_observed_listings([lid])
 
         ingestor = WaxpeerIngestor(callback=on_new, on_removed=on_removed, on_updated=on_updated)
         await ingestor.start(session=session)
@@ -1587,15 +1588,14 @@ class ObservationIngestor:
                     await self._collect_dmarket_sales(session)
                 matched = self.observer._db.reconcile_and_save(retention_days=7)
                 self.observer._db.cleanup_old_marketplace_data(days=7)
-                elapsed = time.perf_counter() - cycle_start
-                logger.info(
-                    f"Réconciliation terminée : {matched} transactions HIGH confidence "
-                    f"en {elapsed:.1f}s."
-                )
             except Exception as e:
                 logger.error(f"Erreur _sales_and_reconciliation_loop: {e}", exc_info=True)
 
             elapsed = time.perf_counter() - cycle_start
+            logger.info(
+                f"Réconciliation terminée : {matched if 'matched' in dir() else 0} "
+                f"transactions HIGH confidence en {elapsed:.1f}s."
+            )
             await asyncio.sleep(max(0, 3600 - elapsed))
 
     # ──────────────────────────────────────────────────────────────────────────
