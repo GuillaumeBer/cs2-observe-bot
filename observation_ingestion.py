@@ -251,8 +251,8 @@ class ObservationIngestor:
                                 sticker_count=norm.get("sticker_count", 0),
                                 sticker_names=norm.get("sticker_names", []),
                                 timestamp=datetime.now(timezone.utc).isoformat(),
-                                listed_at=norm.get("listed_at"),
-                                listed_at_source=norm.get("listed_at_source"),
+                                listed_at=norm.get("listed_at") or time.time(),
+                                listed_at_source=norm.get("listed_at_source") or "poll_fallback",
                                 is_target=is_tgt,
                             )
                             new_count += 1
@@ -1408,7 +1408,9 @@ class ObservationIngestor:
             if not name:
                 return
             lid = listing.get("id")
-            listed_at = listing.get("listed_at")
+            # Waxpeer WebSocket ne fournit pas de timestamp dans add_item :
+            # time.time() est la meilleure approximation (précis à quelques secondes)
+            listed_at = listing.get("listed_at") or time.time()
             stickers = listing.get("item", {}).get("stickers", [])
             sticker_names = [s["name"] for s in stickers]
             is_tgt = (name in self.target_skins) if self.target_skins else True
