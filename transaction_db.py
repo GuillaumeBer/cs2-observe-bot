@@ -135,6 +135,7 @@ class TransactionDatabase:
                 # Index marketplace_sales
                 conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_dedup ON marketplace_sales (platform, market_hash_name, float_value, sale_ts);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_reconcile ON marketplace_sales (platform, market_hash_name, float_value);")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_unreconciled ON marketplace_sales (reconciled_at) WHERE reconciled_at IS NULL;")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_cleanup ON marketplace_sales (fetched_at);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_week ON skin_market_stats (week_label);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_skin ON skin_market_stats (market_hash_name);")
@@ -146,6 +147,7 @@ class TransactionDatabase:
                     "ALTER TABLE observed_listings ADD COLUMN is_target INTEGER NOT NULL DEFAULT 1;",
                     "ALTER TABLE observed_listings ADD COLUMN listed_at_source TEXT;",
                     "ALTER TABLE observed_listings ADD COLUMN original_listed_at REAL;",
+                    "ALTER TABLE marketplace_sales ADD COLUMN reconciled_at REAL;",
                 ]:
                     try:
                         conn.execute(migration)
@@ -1031,7 +1033,8 @@ class TransactionDatabase:
         matched = 0
         try:
             max_window = retention_days * 86400
-            # Récupérer tous les matches en une passe
+            now_ts = time.time()
+            # Récupérer uniquement les ventes non encore réconciliées
             rows = conn.execute("""
                 SELECT
                     s.id            AS sale_id,
@@ -1066,11 +1069,11 @@ class TransactionDatabase:
                           AND l2.original_listed_at > s.sale_ts - ?
                     )
                 WHERE l.float_value IS NOT NULL
+                  AND s.reconciled_at IS NULL
                 ORDER BY s.id
             """, (max_window, max_window)).fetchall()
 
-            sale_ids_to_delete = []
-            listing_ids_to_delete = []
+            sale_ids_to_mark = []
 
             for row in rows:
                 ttd_ms = max(0.0, row["ttd_ms"])
@@ -1110,16 +1113,18 @@ class TransactionDatabase:
                     confidence="HIGH",
                     ref_price_usd=ref_price,
                 )
-                # Toujours supprimer la vente de marketplace_sales (évite accumulation)
-                sale_ids_to_delete.append((row["sale_id"],))
+                # Marquer la vente comme réconciliée (on ne supprime pas, cleanup 7j s'en charge)
+                # Les observed_listings ne sont pas supprimés non plus
+                sale_ids_to_mark.append((now_ts, row["sale_id"]))
                 if saved:
-                    listing_ids_to_delete.append((row["listing_id"],))
                     matched += 1
 
-            if sale_ids_to_delete:
+            if sale_ids_to_mark:
                 with conn:
-                    conn.executemany("DELETE FROM marketplace_sales WHERE id = ?", sale_ids_to_delete)
-                    conn.executemany("DELETE FROM observed_listings WHERE listing_id = ?", listing_ids_to_delete)
+                    conn.executemany(
+                        "UPDATE marketplace_sales SET reconciled_at = ? WHERE id = ?",
+                        sale_ids_to_mark
+                    )
 
         except Exception as e:
             logger.error(f"Erreur reconcile_and_save: {e}")
