@@ -1520,8 +1520,8 @@ class ObservationIngestor:
             return 0
 
     async def _collect_dmarket_sales(self, session: aiohttp.ClientSession) -> int:
-        """Récupère les dernières ventes DMarket par skin et les insère en batch progressif.
-        Insert tous les 500 skins pour sauvegarder progressivement et détecter les blocages."""
+        """Récupère les dernières ventes DMarket par skin avec retry sur timeout.
+        Timeout 12s + retry 2x + continue même si fail (ne bloque jamais la réconciliation)."""
         import urllib.parse
         import yarl
 
@@ -1531,7 +1531,7 @@ class ObservationIngestor:
             logger.info("DMarket sales : aucun skin actif à collecter.")
             return 0
 
-        logger.info(f"DMarket sales : démarrage collecte {len(skin_names)} skins (batch insert tous les 500)...")
+        logger.info(f"DMarket sales : démarrage collecte {len(skin_names)} skins (timeout 12s + retry 2x)...")
         now = time.time()
         batch_records = []
         total_inserted = 0
@@ -1560,42 +1560,60 @@ class ObservationIngestor:
             headers = generate_dmarket_headers(
                 config.DMARKET_PUBLIC_KEY, config.DMARKET_SECRET_KEY, "GET", raw_path
             )
-            try:
-                async with session.get(
-                    "https://api.dmarket.com" + raw_path, headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=8)
-                ) as resp:
-                    if resp.status != 200:
-                        if resp.status == 429:
-                            logger.warning(f"DMarket sales : HTTP 429 (rate limited) à {idx}/{len(skin_names)}")
-                        http_errors += 1
+
+            # Retry loop : 2 tentatives avant abandon
+            success = False
+            for attempt in range(2):
+                try:
+                    async with session.get(
+                        "https://api.dmarket.com" + raw_path, headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=12)  # Timeout 12s
+                    ) as resp:
+                        if resp.status != 200:
+                            if resp.status == 429:
+                                logger.warning(f"DMarket sales : HTTP 429 (rate limited) à {idx}/{len(skin_names)}")
+                            http_errors += 1
+                            success = False
+                            break  # Pas de retry sur HTTP error, skip ce skin
+
+                        data = await resp.json()
+                        for sale in data.get("sales") or []:
+                            raw_price = sale.get("price")
+                            try:
+                                price_usd = float(raw_price) if isinstance(raw_price, str) else float(raw_price.get("amount", 0)) / 100.0
+                            except (TypeError, ValueError, AttributeError):
+                                continue
+                            try:
+                                sale_ts = float(sale.get("date", 0))
+                            except (TypeError, ValueError):
+                                continue
+                            fv = (sale.get("offerAttributes") or {}).get("floatValue")
+                            if not fv:
+                                continue
+                            try:
+                                fv = float(fv)
+                            except (TypeError, ValueError):
+                                continue
+                            batch_records.append(("dmarket", skin_name, fv, price_usd, sale_ts, now))
+
+                        success = True
+                        break  # Succès, arrêter les retries
+
+                except asyncio.TimeoutError:
+                    if attempt == 0:
+                        # Premier timeout : retry après 1s
+                        logger.debug(f"DMarket sales : timeout attempt 1 à {idx}/{len(skin_names)}, retry...")
+                        await asyncio.sleep(1)
                         continue
-                    data = await resp.json()
-                    for sale in data.get("sales") or []:
-                        raw_price = sale.get("price")
-                        try:
-                            price_usd = float(raw_price) if isinstance(raw_price, str) else float(raw_price.get("amount", 0)) / 100.0
-                        except (TypeError, ValueError, AttributeError):
-                            continue
-                        try:
-                            sale_ts = float(sale.get("date", 0))
-                        except (TypeError, ValueError):
-                            continue
-                        fv = (sale.get("offerAttributes") or {}).get("floatValue")
-                        if not fv:
-                            continue
-                        try:
-                            fv = float(fv)
-                        except (TypeError, ValueError):
-                            continue
-                        batch_records.append(("dmarket", skin_name, fv, price_usd, sale_ts, now))
-            except asyncio.TimeoutError:
-                timeout_errors += 1
-                logger.warning(f"DMarket sales : timeout à {idx}/{len(skin_names)} ({skin_name})")
-                continue
-            except Exception as e:
-                logger.warning(f"DMarket sales : erreur à {idx}/{len(skin_names)} ({skin_name}): {type(e).__name__}")
-                continue
+                    else:
+                        # Deuxième timeout : skip ce skin et continuer
+                        timeout_errors += 1
+                        logger.warning(f"DMarket sales : timeout après 2 attempts à {idx}/{len(skin_names)} ({skin_name}), skip")
+                        break
+
+                except Exception as e:
+                    logger.warning(f"DMarket sales : erreur à {idx}/{len(skin_names)} ({skin_name}): {type(e).__name__}")
+                    break  # Skip ce skin
 
             # Insérer par batch tous les 500 skins
             if len(batch_records) >= batch_size or idx == len(skin_names):
@@ -1619,7 +1637,8 @@ class ObservationIngestor:
 
     async def _sales_and_reconciliation_loop(self, session: aiohttp.ClientSession) -> None:
         """Boucle horaire : collecte les ventes des APIs, réconcilie avec les listings,
-        sauvegarde des transactions HIGH confidence, nettoie les données anciennes."""
+        sauvegarde des transactions HIGH confidence, nettoie les données anciennes.
+        Continue la réconciliation même si collecte échoue (ne bloque jamais)."""
         await asyncio.sleep(120)  # Laisser le bot démarrer avant le premier cycle
 
         while self.is_running:
@@ -1629,11 +1648,19 @@ class ObservationIngestor:
             try:
                 if self.platform in ("waxpeer", "all"):
                     logger.debug("  ├─ Collecte Waxpeer...")
-                    await self._collect_waxpeer_sales(session)
+                    try:
+                        await self._collect_waxpeer_sales(session)
+                    except Exception as e:
+                        logger.error(f"  ✗ Erreur collecte Waxpeer: {type(e).__name__}: {e}")
+                        # Continue même si Waxpeer fail
 
                 if self.platform in ("dmarket", "all"):
                     logger.debug("  ├─ Collecte DMarket...")
-                    await self._collect_dmarket_sales(session)
+                    try:
+                        await self._collect_dmarket_sales(session)
+                    except Exception as e:
+                        logger.error(f"  ✗ Erreur collecte DMarket: {type(e).__name__}: {e}")
+                        # Continue même si DMarket fail
 
                 logger.debug("  ├─ Réconciliation marketplace_sales...")
                 matched = self.observer._db.reconcile_and_save(retention_days=7)
@@ -1642,7 +1669,7 @@ class ObservationIngestor:
                 self.observer._db.cleanup_old_marketplace_data(days=7)
 
             except Exception as e:
-                logger.error(f"  ✗ Erreur _sales_and_reconciliation_loop: {e}", exc_info=True)
+                logger.error(f"  ✗ Erreur critique réconciliation: {e}", exc_info=True)
 
             elapsed = time.perf_counter() - cycle_start
             logger.info(
