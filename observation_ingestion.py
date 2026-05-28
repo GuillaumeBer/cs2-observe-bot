@@ -1580,6 +1580,7 @@ class ObservationIngestor:
 
         while self.is_running:
             cycle_start = time.perf_counter()
+            matched = 0
             logger.info("Début du cycle collecte + réconciliation...")
             try:
                 if self.platform in ("waxpeer", "all"):
@@ -1593,8 +1594,8 @@ class ObservationIngestor:
 
             elapsed = time.perf_counter() - cycle_start
             logger.info(
-                f"Réconciliation terminée : {matched if 'matched' in dir() else 0} "
-                f"transactions HIGH confidence en {elapsed:.1f}s."
+                f"Réconciliation terminée : {matched} transactions HIGH confidence "
+                f"en {elapsed:.1f}s."
             )
             await asyncio.sleep(max(0, 3600 - elapsed))
 
