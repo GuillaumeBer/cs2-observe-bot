@@ -71,6 +71,7 @@ class TransactionDatabase:
             listing_id TEXT PRIMARY KEY,
             timestamp TEXT NOT NULL,
             listed_at REAL,
+            original_listed_at REAL,
             market_hash_name TEXT NOT NULL,
             price_cents INTEGER NOT NULL,
             float_value REAL,
@@ -78,8 +79,19 @@ class TransactionDatabase:
             sticker_count INTEGER DEFAULT 0,
             sticker_names TEXT,
             platform TEXT NOT NULL,
-            is_target INTEGER NOT NULL DEFAULT 1,  -- 1 = skin cible (800), 0 = hors-cible
-            listed_at_source TEXT  -- 'createdAt' | 'updatedAt' | NULL
+            is_target INTEGER NOT NULL DEFAULT 1,
+            listed_at_source TEXT
+        );
+        """
+        query_sales = """
+        CREATE TABLE IF NOT EXISTS marketplace_sales (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform         TEXT    NOT NULL,
+            market_hash_name TEXT    NOT NULL,
+            float_value      REAL    NOT NULL,
+            price_usd        REAL    NOT NULL,
+            sale_ts          REAL    NOT NULL,
+            fetched_at       REAL    NOT NULL
         );
         """
         query_stats = """
@@ -108,38 +120,43 @@ class TransactionDatabase:
                 conn.execute(query_opp)
                 conn.execute(query_observed)
                 conn.execute(query_stats)
-                # Index pour les requêtes fréquentes
+                conn.execute(query_sales)
+                # Index transactions
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_name ON transactions (market_hash_name);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_name_float ON transactions (market_hash_name, float_value);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_opp_name ON opportunities (market_hash_name);")
+                # Index observed_listings
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_name ON observed_listings (market_hash_name);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_platform ON observed_listings (platform);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_listed_at ON observed_listings (listed_at);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_platform_skin ON observed_listings (platform, market_hash_name);")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_reconcile ON observed_listings (platform, market_hash_name, float_value, original_listed_at);")
+                # Index marketplace_sales
+                conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_dedup ON marketplace_sales (platform, market_hash_name, float_value, sale_ts);")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_reconcile ON marketplace_sales (platform, market_hash_name, float_value);")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_cleanup ON marketplace_sales (fetched_at);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_week ON skin_market_stats (week_label);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_skin ON skin_market_stats (market_hash_name);")
                 # Migrations pour BD existante
-                try:
-                    conn.execute("ALTER TABLE transactions ADD COLUMN confidence TEXT NOT NULL DEFAULT 'LOW';")
-                except Exception:
-                    pass
-                try:
-                    conn.execute("ALTER TABLE observed_listings ADD COLUMN listed_at REAL;")
-                except Exception:
-                    pass
-                try:
-                    conn.execute("ALTER TABLE transactions ADD COLUMN ref_price_usd REAL;")
-                except Exception:
-                    pass
-                try:
-                    conn.execute("ALTER TABLE observed_listings ADD COLUMN is_target INTEGER NOT NULL DEFAULT 1;")
-                except Exception:
-                    pass
-                try:
-                    conn.execute("ALTER TABLE observed_listings ADD COLUMN listed_at_source TEXT;")
-                except Exception:
-                    pass
-            logger.info("Base de données initialisée avec succès (tables: transactions, opportunities, observed_listings, skin_market_stats).")
+                for migration in [
+                    "ALTER TABLE transactions ADD COLUMN confidence TEXT NOT NULL DEFAULT 'LOW';",
+                    "ALTER TABLE observed_listings ADD COLUMN listed_at REAL;",
+                    "ALTER TABLE transactions ADD COLUMN ref_price_usd REAL;",
+                    "ALTER TABLE observed_listings ADD COLUMN is_target INTEGER NOT NULL DEFAULT 1;",
+                    "ALTER TABLE observed_listings ADD COLUMN listed_at_source TEXT;",
+                    "ALTER TABLE observed_listings ADD COLUMN original_listed_at REAL;",
+                ]:
+                    try:
+                        conn.execute(migration)
+                    except Exception:
+                        pass
+                # Backfill original_listed_at = listed_at pour les rows existantes
+                conn.execute("""
+                    UPDATE observed_listings
+                    SET original_listed_at = listed_at
+                    WHERE original_listed_at IS NULL AND listed_at IS NOT NULL
+                """)
+            logger.info("Base de données initialisée avec succès (tables: transactions, opportunities, observed_listings, skin_market_stats, marketplace_sales).")
         except Exception as e:
             logger.error(f"Erreur d'initialisation de la base de données : {e}")
         finally:
@@ -540,29 +557,23 @@ class TransactionDatabase:
         if timestamp is None:
             timestamp = datetime.now(timezone.utc).isoformat()
         stickers_json = json.dumps(sticker_names or [])
+        # original_listed_at = listed_at au moment de l'INSERT, jamais mis à jour ensuite
         query = """
         INSERT OR IGNORE INTO observed_listings (
-            listing_id, timestamp, listed_at, market_hash_name, price_cents,
+            listing_id, timestamp, listed_at, original_listed_at, market_hash_name, price_cents,
             float_value, paint_seed, sticker_count, sticker_names, platform, is_target, listed_at_source
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         conn = self._get_connection()
         try:
             with conn:
-                if not is_target and float_value is not None and float_value > 0:
-                    # Pour les items hors-cible, on ne maintient qu'un seul listing (le plus récent)
-                    # On supprime donc l'ancien listing avec le même float sur cette plateforme ET ce skin
-                    conn.execute(
-                        "DELETE FROM observed_listings WHERE float_value = ? AND platform = ? AND market_hash_name = ? AND is_target = 0;",
-                        (float_value, platform, market_hash_name)
-                    )
-
                 conn.execute(
                     query,
                     (
                         listing_id,
                         timestamp,
                         listed_at,
+                        listed_at,  # original_listed_at = listed_at à l'insertion
                         market_hash_name,
                         price_cents,
                         float_value,
@@ -977,6 +988,176 @@ class TransactionDatabase:
         finally:
             conn.close()
         return upgraded
+
+    # -------------------------------------------------------------------------
+    # Nouvelle architecture : marketplace_sales + réconciliation
+    # -------------------------------------------------------------------------
+
+    def insert_marketplace_sales(self, records: list) -> int:
+        """Insère en batch les ventes récupérées des APIs. records = liste de tuples
+        (platform, market_hash_name, float_value, price_usd, sale_ts, fetched_at).
+        Retourne le nombre de nouvelles lignes insérées (doublons ignorés)."""
+        if not records:
+            return 0
+        conn = self._get_connection()
+        try:
+            with conn:
+                before = conn.execute("SELECT COUNT(*) FROM marketplace_sales").fetchone()[0]
+                conn.executemany("""
+                    INSERT OR IGNORE INTO marketplace_sales
+                        (platform, market_hash_name, float_value, price_usd, sale_ts, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, records)
+                after = conn.execute("SELECT COUNT(*) FROM marketplace_sales").fetchone()[0]
+            return after - before
+        except Exception as e:
+            logger.error(f"Erreur insert_marketplace_sales: {e}")
+            return 0
+        finally:
+            conn.close()
+
+    def reconcile_and_save(self, retention_days: int = 7) -> int:
+        """Matche chaque vente dans marketplace_sales avec le listing observé le plus
+        récent antérieur à la vente (même platform, skin, float ±1e-4, dans la fenêtre
+        de retention_days). Sauvegarde une transaction HIGH confidence pour chaque match
+        puis supprime les deux lignes correspondantes. Retourne le nombre de matches."""
+        conn = self._get_connection()
+        matched = 0
+        try:
+            max_window = retention_days * 86400
+            # Récupérer tous les matches en une passe
+            rows = conn.execute("""
+                SELECT
+                    s.id            AS sale_id,
+                    l.listing_id,
+                    l.market_hash_name,
+                    l.float_value,
+                    l.price_cents,
+                    s.price_usd,
+                    s.sale_ts,
+                    l.original_listed_at,
+                    (s.sale_ts - l.original_listed_at) * 1000 AS ttd_ms,
+                    l.platform,
+                    l.paint_seed,
+                    l.sticker_count,
+                    l.sticker_names
+                FROM marketplace_sales s
+                JOIN observed_listings l ON
+                    l.platform = s.platform
+                    AND l.market_hash_name = s.market_hash_name
+                    AND l.float_value BETWEEN s.float_value - 0.0001 AND s.float_value + 0.0001
+                    AND l.original_listed_at IS NOT NULL
+                    AND l.original_listed_at < s.sale_ts
+                    AND l.original_listed_at > s.sale_ts - ?
+                    AND l.original_listed_at = (
+                        SELECT MAX(l2.original_listed_at)
+                        FROM observed_listings l2
+                        WHERE l2.platform = l.platform
+                          AND l2.market_hash_name = l.market_hash_name
+                          AND l2.float_value BETWEEN s.float_value - 0.0001 AND s.float_value + 0.0001
+                          AND l2.original_listed_at < s.sale_ts
+                          AND l2.original_listed_at > s.sale_ts - ?
+                    )
+                WHERE l.float_value IS NOT NULL
+                ORDER BY s.id
+            """, (max_window, max_window)).fetchall()
+
+            sale_ids_to_delete = []
+            listing_ids_to_delete = []
+
+            for row in rows:
+                ttd_ms = max(0.0, row["ttd_ms"])
+                try:
+                    sticker_names = json.loads(row["sticker_names"] or "[]")
+                except Exception:
+                    sticker_names = []
+
+                sale_ts_iso = datetime.fromtimestamp(row["sale_ts"], timezone.utc).isoformat()
+                ref_price = self._compute_ref_price(
+                    row["market_hash_name"], before_timestamp=sale_ts_iso
+                )
+
+                saved = self.save_transaction(
+                    market_hash_name=row["market_hash_name"],
+                    price_usd=row["price_usd"],
+                    ttd_ms=ttd_ms,
+                    platform=row["platform"],
+                    category=self._ttd_category(ttd_ms),
+                    float_value=row["float_value"],
+                    paint_seed=row["paint_seed"],
+                    sticker_count=row["sticker_count"] or 0,
+                    sticker_names=sticker_names,
+                    timestamp=sale_ts_iso,
+                    confidence="HIGH",
+                    ref_price_usd=ref_price,
+                )
+                if saved:
+                    sale_ids_to_delete.append((row["sale_id"],))
+                    listing_ids_to_delete.append((row["listing_id"],))
+                    matched += 1
+
+            if sale_ids_to_delete:
+                with conn:
+                    conn.executemany("DELETE FROM marketplace_sales WHERE id = ?", sale_ids_to_delete)
+                    conn.executemany("DELETE FROM observed_listings WHERE listing_id = ?", listing_ids_to_delete)
+
+        except Exception as e:
+            logger.error(f"Erreur reconcile_and_save: {e}")
+        finally:
+            conn.close()
+        return matched
+
+    def _ttd_category(self, ttd_ms: float) -> str:
+        bot_ms = getattr(__import__("config"), "OBS_BOT_SNIPE_TTD_MS", 5000)
+        fast_ms = getattr(__import__("config"), "OBS_FAST_HUMAN_TTD_MS", 60000)
+        if ttd_ms < bot_ms:
+            return "BOT_SNIPE"
+        if ttd_ms < fast_ms:
+            return "FAST_HUMAN"
+        return "NORMAL_SALE"
+
+    def cleanup_old_marketplace_data(self, days: int = 7) -> tuple:
+        """Supprime les ventes et listings plus anciens que days jours.
+        Retourne (sales_deleted, listings_deleted)."""
+        cutoff = time.time() - days * 86400
+        cutoff_iso = datetime.fromtimestamp(cutoff, timezone.utc).isoformat()
+        conn = self._get_connection()
+        try:
+            with conn:
+                c1 = conn.execute(
+                    "DELETE FROM marketplace_sales WHERE fetched_at < ?", (cutoff,)
+                ).rowcount
+                c2 = conn.execute(
+                    "DELETE FROM observed_listings WHERE timestamp < ?", (cutoff_iso,)
+                ).rowcount
+            if c1 or c2:
+                logger.info(f"Cleanup 7j : {c1} sales supprimées, {c2} listings supprimés.")
+            return c1, c2
+        except Exception as e:
+            logger.error(f"Erreur cleanup_old_marketplace_data: {e}")
+            return 0, 0
+        finally:
+            conn.close()
+
+    def get_active_skin_names_for_sales(self, platform: str, max_age_hours: float = 7 * 24) -> List[str]:
+        """Retourne les market_hash_name distincts ayant des listings actifs récents,
+        pour piloter la collecte per-skin des sales APIs."""
+        cutoff_ts = time.time() - max_age_hours * 3600
+        cutoff_iso = datetime.fromtimestamp(cutoff_ts, timezone.utc).isoformat()
+        conn = self._get_connection()
+        try:
+            rows = conn.execute("""
+                SELECT DISTINCT market_hash_name FROM observed_listings
+                WHERE platform = ?
+                  AND ((listed_at IS NOT NULL AND listed_at > ?)
+                       OR (listed_at IS NULL AND timestamp > ?))
+            """, (platform, cutoff_ts, cutoff_iso)).fetchall()
+            return [r[0] for r in rows]
+        except Exception as e:
+            logger.error(f"Erreur get_active_skin_names_for_sales: {e}")
+            return []
+        finally:
+            conn.close()
 
     # -------------------------------------------------------------------------
     # skin_market_stats — Agrégation hebdomadaire des skins hors-cible

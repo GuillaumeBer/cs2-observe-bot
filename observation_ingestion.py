@@ -85,8 +85,6 @@ class ObservationIngestor:
         self._verification_queue = None
         self._dmarket_cycle = 0
         self._matched_sales_cache = FIFOUniqueCache(maxsize=1000)
-        # lid → {name, price_cents, float_value, original_listed_at, removed_at, stickers...}
-        self._waxpeer_pending_removals: dict = {}
 
         # Charger les skins cibles
         self.target_skins = set()
@@ -137,8 +135,9 @@ class ObservationIngestor:
             self._tasks.append(
                 asyncio.create_task(self._observe_waxpeer(session))
             )
+        if self.platform in ("waxpeer", "dmarket", "all"):
             self._tasks.append(
-                asyncio.create_task(self._observe_waxpeer_deferred_loop(session))
+                asyncio.create_task(self._sales_and_reconciliation_loop(session))
             )
         if self.platform in ("market_csgo", "all") and config.MARKET_CSGO_ENABLED:
             self._tasks.append(
@@ -331,7 +330,6 @@ class ObservationIngestor:
                 logger.info("Début de la boucle de réconciliation différée DMarket...")
 
                 self.observer._db.clean_old_observed_listings(config.OBSERVER_MAX_TTD_SEC)
-                self.observer._db.deduplicate_target_listings("dmarket")
 
                 # Option A : récupérer uniquement la liste des skins distincts (pas tous les listings)
                 skin_names = self.observer._db.get_pending_observed_skin_names("dmarket")
@@ -1395,18 +1393,13 @@ class ObservationIngestor:
     async def _observe_waxpeer(self, session: aiohttp.ClientSession) -> None:
         from waxpeer_ingestion import WaxpeerIngestor
 
-        logger.info("Waxpeer Observation : abonné au flux WebSocket...")
+        logger.info("Waxpeer Observation : abonné au flux WebSocket (tous skins $5-$250)...")
 
         min_price_cents = int(config.MIN_PRICE_USD * 100)
         max_price_cents = int(config.MAX_PRICE_USD * 100)
 
-        # listed_at original conservé ici avant tout reprixage (jamais écrasé par on_updated)
-        _original_listed: dict = {}  # lid → unix ts
-
         def on_new(listing: dict):
-            name = listing.get("market_hash_name", "")
-            if self.target_skins and name not in self.target_skins:
-                return
+            # Filtre uniquement sur prix et float — plus de filtre target_skins
             fv = listing.get("item", {}).get("float_value")
             if not fv or fv <= 0:
                 return
@@ -1414,17 +1407,15 @@ class ObservationIngestor:
             if not (min_price_cents <= price <= max_price_cents):
                 return
 
+            name = listing.get("market_hash_name", "")
+            if not name:
+                return
             lid = listing.get("id")
             listed_at = listing.get("listed_at")
             stickers = listing.get("item", {}).get("stickers", [])
             sticker_names = [s["name"] for s in stickers]
             is_tgt = (name in self.target_skins) if self.target_skins else True
 
-            # Mémoriser listed_at original (non écrasé par les reprixes)
-            if lid and listed_at:
-                _original_listed[lid] = listed_at
-
-            # Mémoire : TTD en temps réel depuis l'événement WebSocket
             self.observer.record_addition({
                 "id": lid,
                 "offer_id": lid.replace("waxpeer_", "") if lid else "",
@@ -1437,7 +1428,6 @@ class ObservationIngestor:
                 "sticker_names": sticker_names,
             }, platform="waxpeer")
 
-            # DB : même structure que DMarket pour la réconciliation différée
             self.observer._db.save_observed_listing(
                 listing_id=lid,
                 market_hash_name=name,
@@ -1457,45 +1447,22 @@ class ObservationIngestor:
             lid = data["id"]
             new_price = data["price_cents"]
             new_ts = data["listed_at"]
-
-            # Mémoire : on met à jour le prix mais PAS _original_listed
             if lid in self.observer._active_listings:
                 self.observer._active_listings[lid]["price_cents"] = new_price
                 self.observer._active_listings[lid]["first_seen_ts"] = new_ts
                 self.observer._active_listings[lid]["ttd_from_listing"] = True
-
-            # DB : même que reprice_detected DMarket → confidence HIGH
-            updated = self.observer._db.update_observed_listing_price(
+            # original_listed_at NON mis à jour — seulement price_cents et listed_at
+            self.observer._db.update_observed_listing_price(
                 listing_id=lid,
                 price_cents=new_price,
                 listed_at=new_ts,
                 listed_at_source="reprice_detected",
             )
-            if updated:
-                logger.debug(
-                    f"Waxpeer reprixage : {lid} → {new_price/100:.2f}$ "
-                    f"({'auto' if data.get('auto') else 'manuel'})"
-                )
 
         def on_removed(data: dict):
+            # Supprimer du listing DB — la réconciliation horaire confirme si c'est une vente
             lid = data["id"]
-            entry = self.observer._active_listings.pop(lid, None)
-            if not entry:
-                # Item hors-filtre (pas dans _active_listings) → nettoyage DB uniquement
-                self.observer._db.delete_observed_listings([lid])
-                _original_listed.pop(lid, None)
-                return
-
-            self._waxpeer_pending_removals[lid] = {
-                "name": entry["name"],
-                "price_cents": entry["price_cents"],
-                "float_value": entry.get("float_value"),
-                "paint_seed": entry.get("paint_seed"),
-                "sticker_count": entry.get("sticker_count", 0),
-                "sticker_names": entry.get("sticker_names", []),
-                "original_listed_at": _original_listed.pop(lid, None),
-                "removed_at": time.time(),
-            }
+            self.observer._active_listings.pop(lid, None)
             self.observer._db.delete_observed_listings([lid])
 
         ingestor = WaxpeerIngestor(callback=on_new, on_removed=on_removed, on_updated=on_updated)
@@ -1509,19 +1476,20 @@ class ObservationIngestor:
         finally:
             await ingestor.stop()
 
-    async def _fetch_waxpeer_sales_history(self, session: aiohttp.ClientSession) -> list:
-        """Retourne les 2000 dernières ventes Waxpeer CS:GO avec timestamp unix normalisé."""
+    async def _collect_waxpeer_sales(self, session: aiohttp.ClientSession) -> int:
+        """Récupère les 2000 dernières ventes Waxpeer et les insère dans marketplace_sales."""
         url = f"https://api.waxpeer.com/v1/sales-history?game=csgo&limit=2000&api={config.WAXPEER_API_KEY}"
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                 if resp.status != 200:
                     logger.warning(f"Waxpeer sales-history: HTTP {resp.status}")
-                    return []
+                    return 0
                 body = await resp.json()
-                sales = body.get("items", [])
-                result = []
-                for s in sales:
-                    fv = s.get("float_value") or s.get("float")
+                items = body.get("items", [])
+                now = time.time()
+                records = []
+                for s in items:
+                    fv = s.get("float") or s.get("float_value")
                     if not fv:
                         continue
                     raw_ts = s.get("date") or s.get("created")
@@ -1538,111 +1506,95 @@ class ObservationIngestor:
                             ).timestamp()
                     except (ValueError, TypeError):
                         continue
-                    result.append({
-                        "name": s.get("market_hash_name") or s.get("name", ""),
-                        "float_value": float(fv),
-                        "price_usd": s.get("price", 0) / 1000.0,
-                        "sale_ts": ts,
-                    })
-                return result
+                    name = s.get("name") or s.get("market_hash_name", "")
+                    if not name:
+                        continue
+                    price_usd = s.get("price", 0) / 1000.0
+                    records.append(("waxpeer", name, float(fv), price_usd, ts, now))
+                inserted = self.observer._db.insert_marketplace_sales(records)
+                logger.info(f"Waxpeer sales : {len(records)} récupérées, {inserted} nouvelles.")
+                return inserted
         except Exception as e:
-            logger.error(f"Waxpeer sales-history fetch error: {e}")
-            return []
+            logger.error(f"Waxpeer _collect_waxpeer_sales: {e}")
+            return 0
 
-    async def _observe_waxpeer_deferred_loop(self, session: aiohttp.ClientSession) -> None:
-        """Croise les removed events Waxpeer avec /v1/sales-history pour confirmer
-        les vraies ventes (HIGH confidence) et ignorer les retraits vendeur."""
-        FLOAT_EPS = 1e-4
-        MATCH_WINDOW_SEC = 300   # sale_ts doit être ≤ 5min après removed_at
-        WITHDRAWAL_TIMEOUT = 1200  # après 20min sans match → retrait, on discard
+    async def _collect_dmarket_sales(self, session: aiohttp.ClientSession) -> int:
+        """Récupère les dernières ventes DMarket par skin et les insère dans marketplace_sales."""
+        import urllib.parse
+        import yarl
+        skin_names = self.observer._db.get_active_skin_names_for_sales("dmarket")
+        if not skin_names:
+            return 0
+        now = time.time()
+        all_records = []
+        for skin_name in skin_names:
+            if not self.is_running:
+                break
+            await asyncio.sleep(0.2)
+            encoded = urllib.parse.quote(skin_name)
+            path = f"/trade-aggregator/v1/last-sales?title={encoded}&gameId=a8db&limit=100"
+            url = yarl.URL("https://api.dmarket.com" + path)
+            raw_path = url.raw_path + (f"?{url.raw_query_string}" if url.raw_query_string else "")
+            headers = generate_dmarket_headers(
+                config.DMARKET_PUBLIC_KEY, config.DMARKET_SECRET_KEY, "GET", raw_path
+            )
+            try:
+                async with session.get(
+                    "https://api.dmarket.com" + raw_path, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=8)
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    for sale in data.get("sales") or []:
+                        raw_price = sale.get("price")
+                        try:
+                            price_usd = float(raw_price) if isinstance(raw_price, str) else float(raw_price.get("amount", 0)) / 100.0
+                        except (TypeError, ValueError, AttributeError):
+                            continue
+                        try:
+                            sale_ts = float(sale.get("date", 0))
+                        except (TypeError, ValueError):
+                            continue
+                        fv = (sale.get("offerAttributes") or {}).get("floatValue")
+                        if not fv:
+                            continue
+                        try:
+                            fv = float(fv)
+                        except (TypeError, ValueError):
+                            continue
+                        all_records.append(("dmarket", skin_name, fv, price_usd, sale_ts, now))
+            except Exception:
+                continue
+        inserted = self.observer._db.insert_marketplace_sales(all_records)
+        logger.info(f"DMarket sales : {len(all_records)} récupérées pour {len(skin_names)} skins, {inserted} nouvelles.")
+        return inserted
 
-        await asyncio.sleep(60)  # Laisser le temps aux premiers events d'arriver
-
-        # Fix rétroactif : croise les transactions LOW déjà en DB avec sales-history
-        logger.info("Waxpeer deferred: démarrage du fix rétroactif des transactions LOW...")
-        try:
-            sales = await self._fetch_waxpeer_sales_history(session)
-            logger.info(f"Waxpeer deferred: {len(sales)} ventes récupérées pour fix rétroactif.")
-            upgraded = self.observer._db.upgrade_waxpeer_low_transactions(sales, FLOAT_EPS)
-            logger.info(f"Waxpeer deferred: {upgraded} transactions LOW upgradées (fix rétroactif).")
-        except Exception as e:
-            logger.error(f"Waxpeer deferred fix rétroactif: {e}", exc_info=True)
+    async def _sales_and_reconciliation_loop(self, session: aiohttp.ClientSession) -> None:
+        """Boucle horaire : collecte les ventes des APIs, réconcilie avec les listings,
+        sauvegarde des transactions HIGH confidence, nettoie les données anciennes."""
+        await asyncio.sleep(120)  # Laisser le bot démarrer avant le premier cycle
 
         while self.is_running:
-            await asyncio.sleep(300)  # Cycle toutes les 5 min
-
+            cycle_start = time.perf_counter()
+            logger.info("Début du cycle collecte + réconciliation...")
             try:
-                sales = await self._fetch_waxpeer_sales_history(session)
-                if not sales:
-                    continue
-
-                now = time.time()
-                confirmed = 0
-                discarded = 0
-
-                for lid in list(self._waxpeer_pending_removals.keys()):
-                    entry = self._waxpeer_pending_removals[lid]
-                    name = entry["name"]
-                    fv = entry["float_value"]
-                    removed_at = entry["removed_at"]
-
-                    if not fv:
-                        # Pas de float → impossible à matcher, discard après timeout
-                        if now - removed_at > WITHDRAWAL_TIMEOUT:
-                            del self._waxpeer_pending_removals[lid]
-                            discarded += 1
-                        continue
-
-                    # Chercher une vente correspondante dans l'historique
-                    best_sale = None
-                    for sale in sales:
-                        if sale["name"] != name:
-                            continue
-                        if abs(sale["float_value"] - fv) > FLOAT_EPS:
-                            continue
-                        # La vente doit être proche du moment du removed event
-                        if abs(sale["sale_ts"] - removed_at) <= MATCH_WINDOW_SEC:
-                            best_sale = sale
-                            break
-
-                    if best_sale:
-                        sale_ts = best_sale["sale_ts"]
-                        original_listed_at = entry["original_listed_at"]
-                        if original_listed_at and original_listed_at < sale_ts:
-                            ttd_ms = (sale_ts - original_listed_at) * 1000
-                        else:
-                            ttd_ms = max(0.0, (sale_ts - removed_at) * 1000 + 1000)
-
-                        sale_ts_iso = datetime.fromtimestamp(sale_ts, timezone.utc).isoformat()
-                        self.observer._process_disappearance(
-                            market_hash_name=name,
-                            price_cents=entry["price_cents"],
-                            ttd_ms=ttd_ms,
-                            platform="waxpeer",
-                            ttd_from_listing=original_listed_at is not None,
-                            float_value=fv,
-                            paint_seed=entry.get("paint_seed"),
-                            sticker_count=entry.get("sticker_count", 0),
-                            sticker_names=entry.get("sticker_names", []),
-                            confidence="HIGH",
-                        )
-                        del self._waxpeer_pending_removals[lid]
-                        confirmed += 1
-
-                    elif now - removed_at > WITHDRAWAL_TIMEOUT:
-                        # Pas de vente trouvée après 20min → retrait vendeur, on ignore
-                        del self._waxpeer_pending_removals[lid]
-                        discarded += 1
-
-                if confirmed or discarded:
-                    logger.info(
-                        f"Waxpeer deferred: {confirmed} ventes HIGH confirmées, "
-                        f"{discarded} retraits ignorés. "
-                        f"En attente : {len(self._waxpeer_pending_removals)}"
-                    )
-
+                if self.platform in ("waxpeer", "all"):
+                    await self._collect_waxpeer_sales(session)
+                if self.platform in ("dmarket", "all"):
+                    await self._collect_dmarket_sales(session)
+                matched = self.observer._db.reconcile_and_save(retention_days=7)
+                self.observer._db.cleanup_old_marketplace_data(days=7)
+                elapsed = time.perf_counter() - cycle_start
+                logger.info(
+                    f"Réconciliation terminée : {matched} transactions HIGH confidence "
+                    f"en {elapsed:.1f}s."
+                )
             except Exception as e:
-                logger.error(f"Waxpeer deferred loop error: {e}")
+                logger.error(f"Erreur _sales_and_reconciliation_loop: {e}", exc_info=True)
+
+            elapsed = time.perf_counter() - cycle_start
+            await asyncio.sleep(max(0, 3600 - elapsed))
 
     # ──────────────────────────────────────────────────────────────────────────
     # BOUCLE D'OBSERVATION MARKET.CSGO (WS + SNAPSHOT PARTIEL)
