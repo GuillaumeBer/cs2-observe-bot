@@ -212,11 +212,12 @@ class ObservationIngestor:
                                     # Entrée warmup : pas en DB, ignorer même si reprixé
                                     continue
                                 if existing_price != current_price:
-                                    # Reprixage confirmé : utiliser updatedAt de l'API (dans norm["listed_at"])
-                                    # qui est plus précis que time.time(). Fallback sur time.time() si absent.
+                                    # Reprixage confirmé. L'API DMarket (polling) ne retourne jamais
+                                    # updatedAt — listed_at_source est toujours createdAt. time.time()
+                                    # est la meilleure approximation du moment du reprixage (~1.5s).
                                     processed_listings[listing_id] = current_price
-                                    reprice_ts = norm.get("listed_at") or time.time()
-                                    reprice_src = norm.get("listed_at_source") or "reprice_detected"
+                                    reprice_ts = time.time()
+                                    reprice_src = "reprice_detected"
                                     updated = self.observer._db.update_observed_listing_price(
                                         listing_id=listing_id,
                                         price_cents=current_price,
@@ -1401,7 +1402,9 @@ class ObservationIngestor:
             if not fv or fv <= 0:
                 return
             price = listing.get("price", 0)
-            if not (min_price_cents <= price <= max_price_cents):
+            # Waxpeer: 1000 = $1. Convertir en cents avant le filtre (min/max sont en cents).
+            price_cents_val = round(price / 10)
+            if not (min_price_cents <= price_cents_val <= max_price_cents):
                 return
 
             name = listing.get("market_hash_name", "")
@@ -1490,6 +1493,7 @@ class ObservationIngestor:
                 records = []
                 min_price = config.MIN_PRICE_USD
                 max_price = config.MAX_PRICE_USD
+                cutoff_ts = now - 7 * 86400
                 for s in items:
                     fv = s.get("float") or s.get("float_value")
                     # Exclure les items sans float (Charms, stickers, etc.)
@@ -1513,8 +1517,10 @@ class ObservationIngestor:
                     if not name:
                         continue
                     price_usd = s.get("price", 0) / 1000.0
-                    # Filtrer hors range prix (cohérent avec l'observation)
+                    # Filtrer hors range prix et ventes trop anciennes
                     if not (min_price <= price_usd <= max_price):
+                        continue
+                    if ts < cutoff_ts:
                         continue
                     records.append(("waxpeer", name, float(fv), price_usd, ts, now))
                 inserted = self.observer._db.insert_marketplace_sales(records)
@@ -1584,6 +1590,7 @@ class ObservationIngestor:
                         data = await resp.json()
                         min_price = config.MIN_PRICE_USD
                         max_price = config.MAX_PRICE_USD
+                        cutoff_ts = now - 7 * 86400  # ignorer les ventes > 7j (hors fenêtre réconciliation)
                         for sale in data.get("sales") or []:
                             raw_price = sale.get("price")
                             try:
@@ -1596,6 +1603,9 @@ class ObservationIngestor:
                             try:
                                 sale_ts = float(sale.get("date", 0))
                             except (TypeError, ValueError):
+                                continue
+                            # Ignorer les ventes hors fenêtre 7j (ne peuvent pas matcher un listing)
+                            if sale_ts < cutoff_ts:
                                 continue
                             fv = (sale.get("offerAttributes") or {}).get("floatValue")
                             if not fv:
