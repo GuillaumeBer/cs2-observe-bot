@@ -224,18 +224,23 @@ def get_transactions(
             "float_value": "float_value",
             "ttd": "ttd_ms",
             "ttd_ms": "ttd_ms",
-            "ttd_seconds": "ttd_ms"
+            "ttd_seconds": "ttd_ms",
+            "discount_pct": "discount_pct",
         }
-        
-        # Validation du champ de tri
+
         db_sort_col = allowed_sort_columns.get(sort_by, "timestamp")
-        
-        # Validation de la direction du tri
         db_sort_dir = "ASC" if sort_dir.lower() == "asc" else "DESC"
 
+        # NULLs en dernier quel que soit le sens du tri
+        null_order = "NULLS LAST" if db_sort_dir == "ASC" else "NULLS LAST"
+
         query = """
-        SELECT id, timestamp, market_hash_name, price_usd, float_value, paint_seed, 
-               sticker_count, sticker_names, (ttd_ms / 1000.0) AS ttd_seconds, platform, confidence 
+        SELECT id, timestamp, market_hash_name, price_usd, float_value, paint_seed,
+               sticker_count, sticker_names, (ttd_ms / 1000.0) AS ttd_seconds, platform, confidence,
+               ref_price_usd,
+               CASE WHEN ref_price_usd IS NOT NULL AND ref_price_usd > 0
+                    THEN (price_usd - ref_price_usd) / ref_price_usd * 100.0
+                    ELSE NULL END AS discount_pct
         FROM transactions WHERE 1=1
         """
         params = []
@@ -275,7 +280,7 @@ def get_transactions(
             query += f" AND market_hash_name NOT IN ({placeholders})"
             params.extend(list(TARGET_SKINS))
 
-        query += f" ORDER BY {db_sort_col} {db_sort_dir} LIMIT ? OFFSET ?;"
+        query += f" ORDER BY {db_sort_col} {db_sort_dir} NULLS LAST LIMIT ? OFFSET ?;"
         params.extend([limit, offset])
 
         cursor = conn.execute(query, params)

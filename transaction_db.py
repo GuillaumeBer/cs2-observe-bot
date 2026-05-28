@@ -864,6 +864,116 @@ class TransactionDatabase:
             conn.close()
         return count
 
+    def deduplicate_target_listings(self, platform: str) -> int:
+        """Pour chaque (market_hash_name, float_value) avec is_target=1 ayant plusieurs
+        entrées, supprime toutes sauf la plus récente (par timestamp).
+        Retourne le nombre de lignes supprimées."""
+        conn = self._get_connection()
+        try:
+            with conn:
+                cursor = conn.execute("""
+                    DELETE FROM observed_listings
+                    WHERE is_target = 1
+                      AND platform = ?
+                      AND rowid NOT IN (
+                          SELECT MAX(rowid)
+                          FROM observed_listings
+                          WHERE is_target = 1
+                            AND platform = ?
+                          GROUP BY market_hash_name, float_value
+                      );
+                """, (platform, platform))
+                count = cursor.rowcount
+            if count > 0:
+                logger.info(
+                    f"Déduplication is_target=1 ({platform}) : {count} doublons supprimés."
+                )
+            return count
+        except Exception as e:
+            logger.error(f"Erreur deduplicate_target_listings({platform}): {e}")
+            return 0
+        finally:
+            conn.close()
+
+    def upgrade_waxpeer_low_transactions(self, sales: list, float_eps: float = 1e-4) -> int:
+        """Charge toutes les transactions Waxpeer LOW en une seule requête, les matche
+        en Python contre les ventes sales-history, puis UPDATE en batch.
+        Retourne le nombre de transactions upgradées."""
+        if not sales:
+            return 0
+        conn = self._get_connection()
+        upgraded = 0
+        try:
+            # Charger toutes les tx LOW waxpeer en une fois
+            rows = conn.execute("""
+                SELECT id, market_hash_name, float_value, timestamp
+                FROM transactions
+                WHERE platform = 'waxpeer' AND confidence = 'LOW'
+            """).fetchall()
+
+            if not rows:
+                return 0
+
+            # Index des tx LOW : (name, float_rounded_4) → [(id, ts_unix), ...]
+            tx_index: dict = {}
+            for r in rows:
+                try:
+                    ts_unix = datetime.fromisoformat(
+                        r["timestamp"].replace("Z", "+00:00")
+                    ).timestamp()
+                except Exception:
+                    ts_unix = 0.0
+                key = (r["market_hash_name"], round(r["float_value"], 4))
+                tx_index.setdefault(key, []).append({
+                    "rowid": r["id"],
+                    "ts_unix": ts_unix,
+                })
+
+            # Matcher chaque vente en Python
+            upgrades: list = []  # (rowid, sale_ts_iso)
+            used_rowids: set = set()
+
+            for sale in sales:
+                name = sale.get("name", "")
+                fv = sale.get("float_value")
+                sale_ts = sale.get("sale_ts")
+                if not name or not fv or not sale_ts:
+                    continue
+
+                # Chercher dans l'index avec float arrondi
+                key = (name, round(fv, 4))
+                candidates = tx_index.get(key, [])
+
+                best = None
+                best_delta = float("inf")
+                for c in candidates:
+                    if c["rowid"] in used_rowids:
+                        continue
+                    delta = abs(c["ts_unix"] - sale_ts)
+                    if delta < 300 and delta < best_delta:
+                        best = c
+                        best_delta = delta
+
+                if best:
+                    sale_ts_iso = datetime.fromtimestamp(sale_ts, timezone.utc).isoformat()
+                    upgrades.append((sale_ts_iso, best["rowid"]))
+                    used_rowids.add(best["rowid"])
+
+            # Batch UPDATE
+            if upgrades:
+                with conn:
+                    conn.executemany(
+                        "UPDATE transactions SET confidence = 'HIGH', timestamp = ? WHERE rowid = ?",
+                        upgrades,
+                    )
+                upgraded = len(upgrades)
+
+        except Exception as e:
+            logger.error(f"Erreur upgrade_waxpeer_low_transactions: {e}")
+        finally:
+            conn.close()
+        return upgraded
+
     # -------------------------------------------------------------------------
     # skin_market_stats — Agrégation hebdomadaire des skins hors-cible
     # -------------------------------------------------------------------------

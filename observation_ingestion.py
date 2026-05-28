@@ -85,7 +85,9 @@ class ObservationIngestor:
         self._verification_queue = None
         self._dmarket_cycle = 0
         self._matched_sales_cache = FIFOUniqueCache(maxsize=1000)
-        
+        # lid → {name, price_cents, float_value, original_listed_at, removed_at, stickers...}
+        self._waxpeer_pending_removals: dict = {}
+
         # Charger les skins cibles
         self.target_skins = set()
         try:
@@ -134,6 +136,9 @@ class ObservationIngestor:
         if self.platform in ("waxpeer", "all"):
             self._tasks.append(
                 asyncio.create_task(self._observe_waxpeer(session))
+            )
+            self._tasks.append(
+                asyncio.create_task(self._observe_waxpeer_deferred_loop(session))
             )
         if self.platform in ("market_csgo", "all") and config.MARKET_CSGO_ENABLED:
             self._tasks.append(
@@ -326,6 +331,7 @@ class ObservationIngestor:
                 logger.info("Début de la boucle de réconciliation différée DMarket...")
 
                 self.observer._db.clean_old_observed_listings(config.OBSERVER_MAX_TTD_SEC)
+                self.observer._db.deduplicate_target_listings("dmarket")
 
                 # Option A : récupérer uniquement la liste des skins distincts (pas tous les listings)
                 skin_names = self.observer._db.get_pending_observed_skin_names("dmarket")
@@ -1394,6 +1400,9 @@ class ObservationIngestor:
         min_price_cents = int(config.MIN_PRICE_USD * 100)
         max_price_cents = int(config.MAX_PRICE_USD * 100)
 
+        # listed_at original conservé ici avant tout reprixage (jamais écrasé par on_updated)
+        _original_listed: dict = {}  # lid → unix ts
+
         def on_new(listing: dict):
             name = listing.get("market_hash_name", "")
             if self.target_skins and name not in self.target_skins:
@@ -1410,6 +1419,10 @@ class ObservationIngestor:
             stickers = listing.get("item", {}).get("stickers", [])
             sticker_names = [s["name"] for s in stickers]
             is_tgt = (name in self.target_skins) if self.target_skins else True
+
+            # Mémoriser listed_at original (non écrasé par les reprixes)
+            if lid and listed_at:
+                _original_listed[lid] = listed_at
 
             # Mémoire : TTD en temps réel depuis l'événement WebSocket
             self.observer.record_addition({
@@ -1445,7 +1458,7 @@ class ObservationIngestor:
             new_price = data["price_cents"]
             new_ts = data["listed_at"]
 
-            # Mémoire : TTD calculé depuis le dernier reprixage
+            # Mémoire : on met à jour le prix mais PAS _original_listed
             if lid in self.observer._active_listings:
                 self.observer._active_listings[lid]["price_cents"] = new_price
                 self.observer._active_listings[lid]["first_seen_ts"] = new_ts
@@ -1466,15 +1479,28 @@ class ObservationIngestor:
 
         def on_removed(data: dict):
             lid = data["id"]
-            # auto_confirm=True : Waxpeer génère trop d'events removed pour passer par la
-            # file de vérification (rate-limit 0.5s → backlog 87min+). La vente est confirmée
-            # a posteriori par le deferred loop qui compare avec /v1/sales-history.
-            self.observer.record_removal(lid, platform="waxpeer", auto_confirm=True)
+            entry = self.observer._active_listings.pop(lid, None)
+            if not entry:
+                # Item hors-filtre (pas dans _active_listings) → nettoyage DB uniquement
+                self.observer._db.delete_observed_listings([lid])
+                _original_listed.pop(lid, None)
+                return
+
+            self._waxpeer_pending_removals[lid] = {
+                "name": entry["name"],
+                "price_cents": entry["price_cents"],
+                "float_value": entry.get("float_value"),
+                "paint_seed": entry.get("paint_seed"),
+                "sticker_count": entry.get("sticker_count", 0),
+                "sticker_names": entry.get("sticker_names", []),
+                "original_listed_at": _original_listed.pop(lid, None),
+                "removed_at": time.time(),
+            }
             self.observer._db.delete_observed_listings([lid])
 
         ingestor = WaxpeerIngestor(callback=on_new, on_removed=on_removed, on_updated=on_updated)
         await ingestor.start(session=session)
-        
+
         try:
             while self.is_running:
                 await asyncio.sleep(1)
@@ -1482,6 +1508,141 @@ class ObservationIngestor:
             pass
         finally:
             await ingestor.stop()
+
+    async def _fetch_waxpeer_sales_history(self, session: aiohttp.ClientSession) -> list:
+        """Retourne les 2000 dernières ventes Waxpeer CS:GO avec timestamp unix normalisé."""
+        url = f"https://api.waxpeer.com/v1/sales-history?game=csgo&limit=2000&api={config.WAXPEER_API_KEY}"
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Waxpeer sales-history: HTTP {resp.status}")
+                    return []
+                body = await resp.json()
+                sales = body.get("items", [])
+                result = []
+                for s in sales:
+                    fv = s.get("float_value") or s.get("float")
+                    if not fv:
+                        continue
+                    raw_ts = s.get("date") or s.get("created")
+                    if not raw_ts:
+                        continue
+                    try:
+                        if isinstance(raw_ts, (int, float)):
+                            ts = float(raw_ts)
+                            if ts > 1e12:
+                                ts /= 1000.0
+                        else:
+                            ts = datetime.fromisoformat(
+                                str(raw_ts).replace("Z", "+00:00")
+                            ).timestamp()
+                    except (ValueError, TypeError):
+                        continue
+                    result.append({
+                        "name": s.get("market_hash_name") or s.get("name", ""),
+                        "float_value": float(fv),
+                        "price_usd": s.get("price", 0) / 1000.0,
+                        "sale_ts": ts,
+                    })
+                return result
+        except Exception as e:
+            logger.error(f"Waxpeer sales-history fetch error: {e}")
+            return []
+
+    async def _observe_waxpeer_deferred_loop(self, session: aiohttp.ClientSession) -> None:
+        """Croise les removed events Waxpeer avec /v1/sales-history pour confirmer
+        les vraies ventes (HIGH confidence) et ignorer les retraits vendeur."""
+        FLOAT_EPS = 1e-4
+        MATCH_WINDOW_SEC = 300   # sale_ts doit être ≤ 5min après removed_at
+        WITHDRAWAL_TIMEOUT = 1200  # après 20min sans match → retrait, on discard
+
+        await asyncio.sleep(60)  # Laisser le temps aux premiers events d'arriver
+
+        # Fix rétroactif : croise les transactions LOW déjà en DB avec sales-history
+        logger.info("Waxpeer deferred: démarrage du fix rétroactif des transactions LOW...")
+        try:
+            sales = await self._fetch_waxpeer_sales_history(session)
+            logger.info(f"Waxpeer deferred: {len(sales)} ventes récupérées pour fix rétroactif.")
+            upgraded = self.observer._db.upgrade_waxpeer_low_transactions(sales, FLOAT_EPS)
+            logger.info(f"Waxpeer deferred: {upgraded} transactions LOW upgradées (fix rétroactif).")
+        except Exception as e:
+            logger.error(f"Waxpeer deferred fix rétroactif: {e}", exc_info=True)
+
+        while self.is_running:
+            await asyncio.sleep(300)  # Cycle toutes les 5 min
+
+            try:
+                sales = await self._fetch_waxpeer_sales_history(session)
+                if not sales:
+                    continue
+
+                now = time.time()
+                confirmed = 0
+                discarded = 0
+
+                for lid in list(self._waxpeer_pending_removals.keys()):
+                    entry = self._waxpeer_pending_removals[lid]
+                    name = entry["name"]
+                    fv = entry["float_value"]
+                    removed_at = entry["removed_at"]
+
+                    if not fv:
+                        # Pas de float → impossible à matcher, discard après timeout
+                        if now - removed_at > WITHDRAWAL_TIMEOUT:
+                            del self._waxpeer_pending_removals[lid]
+                            discarded += 1
+                        continue
+
+                    # Chercher une vente correspondante dans l'historique
+                    best_sale = None
+                    for sale in sales:
+                        if sale["name"] != name:
+                            continue
+                        if abs(sale["float_value"] - fv) > FLOAT_EPS:
+                            continue
+                        # La vente doit être proche du moment du removed event
+                        if abs(sale["sale_ts"] - removed_at) <= MATCH_WINDOW_SEC:
+                            best_sale = sale
+                            break
+
+                    if best_sale:
+                        sale_ts = best_sale["sale_ts"]
+                        original_listed_at = entry["original_listed_at"]
+                        if original_listed_at and original_listed_at < sale_ts:
+                            ttd_ms = (sale_ts - original_listed_at) * 1000
+                        else:
+                            ttd_ms = max(0.0, (sale_ts - removed_at) * 1000 + 1000)
+
+                        sale_ts_iso = datetime.fromtimestamp(sale_ts, timezone.utc).isoformat()
+                        self.observer._process_disappearance(
+                            market_hash_name=name,
+                            price_cents=entry["price_cents"],
+                            ttd_ms=ttd_ms,
+                            platform="waxpeer",
+                            ttd_from_listing=original_listed_at is not None,
+                            float_value=fv,
+                            paint_seed=entry.get("paint_seed"),
+                            sticker_count=entry.get("sticker_count", 0),
+                            sticker_names=entry.get("sticker_names", []),
+                            confidence="HIGH",
+                        )
+                        del self._waxpeer_pending_removals[lid]
+                        confirmed += 1
+
+                    elif now - removed_at > WITHDRAWAL_TIMEOUT:
+                        # Pas de vente trouvée après 20min → retrait vendeur, on ignore
+                        del self._waxpeer_pending_removals[lid]
+                        discarded += 1
+
+                if confirmed or discarded:
+                    logger.info(
+                        f"Waxpeer deferred: {confirmed} ventes HIGH confirmées, "
+                        f"{discarded} retraits ignorés. "
+                        f"En attente : {len(self._waxpeer_pending_removals)}"
+                    )
+
+            except Exception as e:
+                logger.error(f"Waxpeer deferred loop error: {e}")
 
     # ──────────────────────────────────────────────────────────────────────────
     # BOUCLE D'OBSERVATION MARKET.CSGO (WS + SNAPSHOT PARTIEL)
