@@ -121,9 +121,8 @@ class ObservationIngestor:
             self._tasks.append(
                 asyncio.create_task(self._observe_dmarket(session))
             )
-            self._tasks.append(
-                asyncio.create_task(self._deferred_verification_loop(session))
-            )
+            # Ancienne boucle de réconciliation DMarket désactivée :
+            # remplacée par _sales_and_reconciliation_loop (marketplace_sales + SQL JOIN)
         if self.platform in ("csfloat", "all"):
             self._tasks.append(
                 asyncio.create_task(self._observe_csfloat(session))
