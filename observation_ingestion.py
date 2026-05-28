@@ -1545,11 +1545,11 @@ class ObservationIngestor:
                 logger.info(f"DMarket sales : arrêt demandé à {idx}/{len(skin_names)} ({100*idx//len(skin_names)}%)")
                 break
 
-            # Log de progression tous les 250 skins
-            if idx - last_progress_count >= 250:
+            # Log de progression tous les 100 skins (INFO level, visible en prod)
+            if idx - last_progress_count >= 100:
                 elapsed = time.perf_counter() - start_time
                 progress_pct = 100 * idx // len(skin_names)
-                logger.debug(f"DMarket sales : {idx}/{len(skin_names)} ({progress_pct}%) en {elapsed:.1f}s")
+                logger.info(f"DMarket sales : {idx}/{len(skin_names)} ({progress_pct}%) en {elapsed:.1f}s — errors: {http_errors}, timeouts: {timeout_errors}")
                 last_progress_count = idx
 
             await asyncio.sleep(0.2)
@@ -1567,7 +1567,7 @@ class ObservationIngestor:
                 try:
                     async with session.get(
                         "https://api.dmarket.com" + raw_path, headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=12)  # Timeout 12s
+                        timeout=aiohttp.ClientTimeout(connect=5, total=12)  # connect 5s + total 12s
                     ) as resp:
                         if resp.status != 200:
                             if resp.status == 429:
@@ -1602,7 +1602,7 @@ class ObservationIngestor:
                 except asyncio.TimeoutError:
                     if attempt == 0:
                         # Premier timeout : retry après 1s
-                        logger.debug(f"DMarket sales : timeout attempt 1 à {idx}/{len(skin_names)}, retry...")
+                        logger.info(f"DMarket sales : timeout attempt 1 à {idx}/{len(skin_names)} ({skin_name}), retry dans 1s...")
                         await asyncio.sleep(1)
                         continue
                     else:
@@ -1612,7 +1612,7 @@ class ObservationIngestor:
                         break
 
                 except Exception as e:
-                    logger.warning(f"DMarket sales : erreur à {idx}/{len(skin_names)} ({skin_name}): {type(e).__name__}")
+                    logger.warning(f"DMarket sales : erreur à {idx}/{len(skin_names)} ({skin_name}): {type(e).__name__}: {e}")
                     break  # Skip ce skin
 
             # Insérer par batch tous les 500 skins
@@ -1622,8 +1622,8 @@ class ObservationIngestor:
                     batch_inserted = self.observer._db.insert_marketplace_sales(batch_records)
                     batch_elapsed = time.perf_counter() - batch_start
                     total_inserted += batch_inserted
-                    logger.debug(
-                        f"DMarket sales batch : {len(batch_records)} traitées, "
+                    logger.info(
+                        f"DMarket sales batch @{idx}/{len(skin_names)} : {len(batch_records)} traitées, "
                         f"{batch_inserted} nouvelles en {batch_elapsed:.2f}s"
                     )
                     batch_records = []
