@@ -185,13 +185,39 @@ def get_global_stats(
 
         active_listings = conn.execute("SELECT COUNT(*) FROM observed_listings;").fetchone()[0]
 
+        # Stats par plateforme
+        platform_stats = {}
+        for row in conn.execute("""
+            SELECT platform,
+              COUNT(*) as total_listings,
+              COUNT(DISTINCT market_hash_name) as unique_skins
+            FROM observed_listings GROUP BY platform
+        """).fetchall():
+            platform_stats[row[0]] = {"listings_total": row[1], "listings_unique_skins": row[2], "sales_unique_skins": 0, "transactions_high": 0}
+
+        for row in conn.execute("""
+            SELECT platform, COUNT(DISTINCT market_hash_name) as n
+            FROM marketplace_sales GROUP BY platform
+        """).fetchall():
+            if row[0] in platform_stats:
+                platform_stats[row[0]]["sales_unique_skins"] = row[1]
+            else:
+                platform_stats[row[0]] = {"listings_total": 0, "listings_unique_skins": 0, "sales_unique_skins": row[1], "transactions_high": 0}
+
+        for row in conn.execute("""
+            SELECT platform, COUNT(*) as n FROM transactions WHERE confidence='HIGH' GROUP BY platform
+        """).fetchall():
+            if row[0] in platform_stats:
+                platform_stats[row[0]]["transactions_high"] = row[1]
+
         return {
             "total_transactions": total_tx,
             "average_ttd_seconds": avg_ttd,
             "bot_snipes_count": bot_snipes,
             "quick_buys_count": quick_buys,
             "normal_sales_count": normal_sales,
-            "active_listings_count": active_listings
+            "active_listings_count": active_listings,
+            "platform_stats": platform_stats
         }
     except Exception as e:
         logger.error(f"Erreur lors du calcul des stats : {e}")
