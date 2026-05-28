@@ -1520,19 +1520,38 @@ class ObservationIngestor:
             return 0
 
     async def _collect_dmarket_sales(self, session: aiohttp.ClientSession) -> int:
-        """Récupère les dernières ventes DMarket par skin et les insère dans marketplace_sales."""
+        """Récupère les dernières ventes DMarket par skin et les insère en batch progressif.
+        Insert tous les 500 skins pour sauvegarder progressivement et détecter les blocages."""
         import urllib.parse
         import yarl
-        # Tous les skins avec des listings actifs (rétention 7j) → ~3000 skins × 0.2s ≈ 10 min
-        # Le budget horaire tolère jusqu'à 30 min de collecte DMarket
+
+        start_time = time.perf_counter()
         skin_names = self.observer._db.get_active_skin_names_for_sales("dmarket")
         if not skin_names:
+            logger.info("DMarket sales : aucun skin actif à collecter.")
             return 0
+
+        logger.info(f"DMarket sales : démarrage collecte {len(skin_names)} skins (batch insert tous les 500)...")
         now = time.time()
-        all_records = []
-        for skin_name in skin_names:
+        batch_records = []
+        total_inserted = 0
+        http_errors = 0
+        timeout_errors = 0
+        batch_size = 500
+        last_progress_count = 0
+
+        for idx, skin_name in enumerate(skin_names, 1):
             if not self.is_running:
+                logger.info(f"DMarket sales : arrêt demandé à {idx}/{len(skin_names)} ({100*idx//len(skin_names)}%)")
                 break
+
+            # Log de progression tous les 250 skins
+            if idx - last_progress_count >= 250:
+                elapsed = time.perf_counter() - start_time
+                progress_pct = 100 * idx // len(skin_names)
+                logger.debug(f"DMarket sales : {idx}/{len(skin_names)} ({progress_pct}%) en {elapsed:.1f}s")
+                last_progress_count = idx
+
             await asyncio.sleep(0.2)
             encoded = urllib.parse.quote(skin_name)
             path = f"/trade-aggregator/v1/last-sales?title={encoded}&gameId=a8db&limit=100"
@@ -1547,6 +1566,9 @@ class ObservationIngestor:
                     timeout=aiohttp.ClientTimeout(total=8)
                 ) as resp:
                     if resp.status != 200:
+                        if resp.status == 429:
+                            logger.warning(f"DMarket sales : HTTP 429 (rate limited) à {idx}/{len(skin_names)}")
+                        http_errors += 1
                         continue
                     data = await resp.json()
                     for sale in data.get("sales") or []:
@@ -1566,12 +1588,34 @@ class ObservationIngestor:
                             fv = float(fv)
                         except (TypeError, ValueError):
                             continue
-                        all_records.append(("dmarket", skin_name, fv, price_usd, sale_ts, now))
-            except Exception:
+                        batch_records.append(("dmarket", skin_name, fv, price_usd, sale_ts, now))
+            except asyncio.TimeoutError:
+                timeout_errors += 1
+                logger.warning(f"DMarket sales : timeout à {idx}/{len(skin_names)} ({skin_name})")
                 continue
-        inserted = self.observer._db.insert_marketplace_sales(all_records)
-        logger.info(f"DMarket sales : {len(all_records)} récupérées pour {len(skin_names)} skins, {inserted} nouvelles.")
-        return inserted
+            except Exception as e:
+                logger.warning(f"DMarket sales : erreur à {idx}/{len(skin_names)} ({skin_name}): {type(e).__name__}")
+                continue
+
+            # Insérer par batch tous les 500 skins
+            if len(batch_records) >= batch_size or idx == len(skin_names):
+                if batch_records:
+                    batch_start = time.perf_counter()
+                    batch_inserted = self.observer._db.insert_marketplace_sales(batch_records)
+                    batch_elapsed = time.perf_counter() - batch_start
+                    total_inserted += batch_inserted
+                    logger.debug(
+                        f"DMarket sales batch : {len(batch_records)} traitées, "
+                        f"{batch_inserted} nouvelles en {batch_elapsed:.2f}s"
+                    )
+                    batch_records = []
+
+        elapsed = time.perf_counter() - start_time
+        logger.info(
+            f"DMarket sales : {total_inserted} insérées sur {len(skin_names)} skins en {elapsed:.1f}s "
+            f"(HTTP errors: {http_errors}, timeouts: {timeout_errors})"
+        )
+        return total_inserted
 
     async def _sales_and_reconciliation_loop(self, session: aiohttp.ClientSession) -> None:
         """Boucle horaire : collecte les ventes des APIs, réconcilie avec les listings,
@@ -1581,23 +1625,33 @@ class ObservationIngestor:
         while self.is_running:
             cycle_start = time.perf_counter()
             matched = 0
-            logger.info("Début du cycle collecte + réconciliation...")
+            logger.info("▶ Début du cycle collecte + réconciliation...")
             try:
                 if self.platform in ("waxpeer", "all"):
+                    logger.debug("  ├─ Collecte Waxpeer...")
                     await self._collect_waxpeer_sales(session)
+
                 if self.platform in ("dmarket", "all"):
+                    logger.debug("  ├─ Collecte DMarket...")
                     await self._collect_dmarket_sales(session)
+
+                logger.debug("  ├─ Réconciliation marketplace_sales...")
                 matched = self.observer._db.reconcile_and_save(retention_days=7)
+
+                logger.debug("  └─ Cleanup données > 7j...")
                 self.observer._db.cleanup_old_marketplace_data(days=7)
+
             except Exception as e:
-                logger.error(f"Erreur _sales_and_reconciliation_loop: {e}", exc_info=True)
+                logger.error(f"  ✗ Erreur _sales_and_reconciliation_loop: {e}", exc_info=True)
 
             elapsed = time.perf_counter() - cycle_start
             logger.info(
-                f"Réconciliation terminée : {matched} transactions HIGH confidence "
-                f"en {elapsed:.1f}s."
+                f"✓ Réconciliation terminée : {matched} transactions HIGH en {elapsed:.1f}s."
             )
-            await asyncio.sleep(max(0, 3600 - elapsed))
+            remaining = 3600 - elapsed
+            if remaining > 0:
+                logger.debug(f"  Prochain cycle dans {remaining:.0f}s...")
+            await asyncio.sleep(max(0, remaining))
 
     # ──────────────────────────────────────────────────────────────────────────
     # BOUCLE D'OBSERVATION MARKET.CSGO (WS + SNAPSHOT PARTIEL)
