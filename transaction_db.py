@@ -1002,13 +1002,16 @@ class TransactionDatabase:
             return 0
         conn = self._get_connection()
         try:
+            # total_changes est cumulatif et fiable pour INSERT OR IGNORE
+            # (cursor.rowcount sur executemany compte les tentatives, pas les insertions réelles)
+            before = conn.total_changes
             with conn:
-                cursor = conn.executemany("""
+                conn.executemany("""
                     INSERT OR IGNORE INTO marketplace_sales
                         (platform, market_hash_name, float_value, price_usd, sale_ts, fetched_at)
                     VALUES (?, ?, ?, ?, ?, ?)
                 """, records)
-            return cursor.rowcount
+            return conn.total_changes - before
         except Exception as e:
             logger.error(f"Erreur insert_marketplace_sales: {e}")
             return 0
