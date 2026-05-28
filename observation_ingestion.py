@@ -254,6 +254,7 @@ class ObservationIngestor:
                                 listed_at=norm.get("listed_at") or time.time(),
                                 listed_at_source=norm.get("listed_at_source") or "poll_fallback",
                                 is_target=is_tgt,
+                                suggested_price_cents=norm.get("suggested_price_cents"),
                             )
                             new_count += 1
 
@@ -760,11 +761,22 @@ class ObservationIngestor:
 
         cheapest_by_sa = extra.get("cheapestBySteamAnalyst") or False
 
+        # suggestedPrice = prix Steam Market fourni par DMarket (en cents USD)
+        suggested_price_cents = None
+        try:
+            sp = raw.get("suggestedPrice") or {}
+            sp_usd = sp.get("USD", "") if isinstance(sp, dict) else ""
+            if sp_usd:
+                suggested_price_cents = int(sp_usd) if "." not in str(sp_usd) else int(round(float(sp_usd) * 100))
+        except (ValueError, TypeError):
+            suggested_price_cents = None
+
         return {
             "id": offer_id or item_id,
             "offer_id": offer_id or item_id,
             "market_hash_name": raw.get("title", ""),
             "price": price_cents,
+            "suggested_price_cents": suggested_price_cents,
             "listed_at": listed_at,
             "listed_at_source": listed_at_source,
             "float_value": float_value,

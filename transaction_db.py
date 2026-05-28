@@ -147,6 +147,7 @@ class TransactionDatabase:
                     "ALTER TABLE observed_listings ADD COLUMN listed_at_source TEXT;",
                     "ALTER TABLE observed_listings ADD COLUMN original_listed_at REAL;",
                     "ALTER TABLE marketplace_sales ADD COLUMN reconciled_at REAL;",
+                    "ALTER TABLE observed_listings ADD COLUMN suggested_price_cents INTEGER;",
                 ]:
                     try:
                         conn.execute(migration)
@@ -169,40 +170,68 @@ class TransactionDatabase:
         finally:
             conn.close()
 
-    def _compute_ref_price(self, market_hash_name: str, before_timestamp: str, limit: int = 50) -> Optional[float]:
+    def _compute_ref_price(
+        self,
+        market_hash_name: str,
+        before_timestamp: str,
+        limit: int = 50,
+        suggested_price_cents: Optional[int] = None,
+    ) -> Optional[float]:
         """
-        Calcule le prix de référence marché pour un item au moment d'une transaction,
-        en utilisant uniquement les ventes passées (avant before_timestamp) et en
-        excluant les snipes bots pour éviter le biais vers le bas.
-        Retourne None si moins de 3 ventes historiques disponibles.
+        Prix de référence hybride (3 sources par priorité) :
+          1. suggestedPrice DMarket (= prix Steam Market) si disponible et cohérent
+          2. Médiane des ventes marketplace_sales 7j (prix réel plateforme)
+          3. Médiane de nos propres transactions (fallback)
         """
-        seuil_bot_ms = getattr(config, "OBS_BOT_SNIPE_TTD_MS", 5000)
-        query = """
-        SELECT price_usd FROM transactions
-        WHERE market_hash_name = ?
-          AND ttd_ms >= ?
-          AND timestamp < ?
-        ORDER BY timestamp DESC
-        LIMIT ?;
-        """
+        DAY = 86400.0
+
+        # Source 1 : suggestedPrice DMarket (Steam Market)
+        if suggested_price_cents and suggested_price_cents > 0:
+            return suggested_price_cents / 100.0
+
         conn = self._get_connection()
-        prices = []
         try:
-            cursor = conn.execute(query, (market_hash_name, seuil_bot_ms, before_timestamp, limit))
-            prices = [row["price_usd"] for row in cursor.fetchall()]
+            before_ts = datetime.fromisoformat(
+                before_timestamp.replace("Z", "+00:00")
+            ).timestamp()
+            cutoff_7d = before_ts - 7 * DAY
+
+            # Source 2 : marketplace_sales récentes (7j, fenêtre adaptative)
+            rows = conn.execute("""
+                SELECT price_usd, sale_ts FROM marketplace_sales
+                WHERE market_hash_name = ?
+                  AND sale_ts < ?
+                  AND sale_ts > ?
+                ORDER BY sale_ts DESC
+            """, (market_hash_name, before_ts, cutoff_7d)).fetchall()
+
+            if len(rows) >= 3:
+                prices_2d = [r["price_usd"] for r in rows if before_ts - r["sale_ts"] < 2 * DAY]
+                prices = prices_2d if len(prices_2d) >= 10 else [r["price_usd"] for r in rows]
+                prices.sort()
+                n = len(prices)
+                return prices[n // 2] if n % 2 else (prices[n // 2 - 1] + prices[n // 2]) / 2.0
+
+            # Source 3 : nos propres transactions (fallback)
+            seuil_bot_ms = getattr(config, "OBS_BOT_SNIPE_TTD_MS", 5000)
+            rows2 = conn.execute("""
+                SELECT price_usd FROM transactions
+                WHERE market_hash_name = ? AND ttd_ms >= ? AND timestamp < ?
+                ORDER BY timestamp DESC LIMIT ?
+            """, (market_hash_name, seuil_bot_ms, before_timestamp, limit)).fetchall()
+
+            prices2 = [r["price_usd"] for r in rows2]
+            if len(prices2) >= 3:
+                prices2.sort()
+                n = len(prices2)
+                return prices2[n // 2] if n % 2 else (prices2[n // 2 - 1] + prices2[n // 2]) / 2.0
+
         except Exception as e:
             logger.error(f"Erreur calcul ref_price pour {market_hash_name} : {e}")
         finally:
             conn.close()
 
-        if len(prices) < 3:
-            return None
-
-        prices.sort()
-        n = len(prices)
-        if n % 2 == 1:
-            return prices[n // 2]
-        return (prices[n // 2 - 1] + prices[n // 2]) / 2.0
+        return None
 
     def save_transaction(
         self,
@@ -564,6 +593,7 @@ class TransactionDatabase:
         listed_at: Optional[float] = None,
         listed_at_source: Optional[str] = None,
         is_target: bool = True,
+        suggested_price_cents: Optional[int] = None,
     ) -> bool:
         if timestamp is None:
             timestamp = datetime.now(timezone.utc).isoformat()
@@ -572,8 +602,9 @@ class TransactionDatabase:
         query = """
         INSERT OR IGNORE INTO observed_listings (
             listing_id, timestamp, listed_at, original_listed_at, market_hash_name, price_cents,
-            float_value, paint_seed, sticker_count, sticker_names, platform, is_target, listed_at_source
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            float_value, paint_seed, sticker_count, sticker_names, platform, is_target,
+            listed_at_source, suggested_price_cents
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         conn = self._get_connection()
         try:
@@ -594,6 +625,7 @@ class TransactionDatabase:
                         platform,
                         1 if is_target else 0,
                         listed_at_source,
+                        suggested_price_cents,
                     ),
                 )
             return True
@@ -1050,6 +1082,7 @@ class TransactionDatabase:
                     s.sale_ts,
                     l.original_listed_at,
                     l.listed_at,
+                    l.suggested_price_cents,
                     COALESCE(l.listed_at, l.original_listed_at) AS effective_listed_at,
                     (s.sale_ts - COALESCE(l.listed_at, l.original_listed_at)) * 1000 AS ttd_ms,
                     l.platform,
@@ -1107,7 +1140,9 @@ class TransactionDatabase:
                 )
 
                 ref_price = self._compute_ref_price(
-                    row["market_hash_name"], before_timestamp=sale_ts_iso
+                    row["market_hash_name"],
+                    before_timestamp=sale_ts_iso,
+                    suggested_price_cents=row["suggested_price_cents"],
                 )
 
                 saved = self.save_transaction(
