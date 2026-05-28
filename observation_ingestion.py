@@ -1488,9 +1488,12 @@ class ObservationIngestor:
                 items = body.get("items", [])
                 now = time.time()
                 records = []
+                min_price = config.MIN_PRICE_USD
+                max_price = config.MAX_PRICE_USD
                 for s in items:
                     fv = s.get("float") or s.get("float_value")
-                    if not fv:
+                    # Exclure les items sans float (Charms, stickers, etc.)
+                    if not fv or float(fv) <= 0:
                         continue
                     raw_ts = s.get("date") or s.get("created")
                     if not raw_ts:
@@ -1510,6 +1513,9 @@ class ObservationIngestor:
                     if not name:
                         continue
                     price_usd = s.get("price", 0) / 1000.0
+                    # Filtrer hors range prix (cohérent avec l'observation)
+                    if not (min_price <= price_usd <= max_price):
+                        continue
                     records.append(("waxpeer", name, float(fv), price_usd, ts, now))
                 inserted = self.observer._db.insert_marketplace_sales(records)
                 logger.info(f"Waxpeer sales : {len(records)} récupérées, {inserted} nouvelles.")
@@ -1576,11 +1582,16 @@ class ObservationIngestor:
                             break  # Pas de retry sur HTTP error, skip ce skin
 
                         data = await resp.json()
+                        min_price = config.MIN_PRICE_USD
+                        max_price = config.MAX_PRICE_USD
                         for sale in data.get("sales") or []:
                             raw_price = sale.get("price")
                             try:
                                 price_usd = float(raw_price) if isinstance(raw_price, str) else float(raw_price.get("amount", 0)) / 100.0
                             except (TypeError, ValueError, AttributeError):
+                                continue
+                            # Filtrer hors range prix (cohérent avec l'observation)
+                            if not (min_price <= price_usd <= max_price):
                                 continue
                             try:
                                 sale_ts = float(sale.get("date", 0))
@@ -1592,6 +1603,9 @@ class ObservationIngestor:
                             try:
                                 fv = float(fv)
                             except (TypeError, ValueError):
+                                continue
+                            # Exclure float <= 0 (items sans float)
+                            if fv <= 0:
                                 continue
                             batch_records.append(("dmarket", skin_name, fv, price_usd, sale_ts, now))
 
