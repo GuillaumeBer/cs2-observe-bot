@@ -1639,46 +1639,86 @@ class ObservationIngestor:
         """Boucle horaire : collecte les ventes des APIs, réconcilie avec les listings,
         sauvegarde des transactions HIGH confidence, nettoie les données anciennes.
         Continue la réconciliation même si collecte échoue (ne bloque jamais)."""
-        await asyncio.sleep(120)  # Laisser le bot démarrer avant le premier cycle
+        import datetime
 
+        logger.info("[RECONCILIATION LOOP] Initialisation en cours... (attente 120s avant 1er cycle)")
+        await asyncio.sleep(120)
+
+        cycle_num = 0
         while self.is_running:
+            cycle_num += 1
             cycle_start = time.perf_counter()
+            cycle_start_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
             matched = 0
-            logger.info("▶ Début du cycle collecte + réconciliation...")
+
+            logger.info(f"[RECONCILIATION LOOP #{cycle_num}] ▶ Début du cycle à {cycle_start_iso}")
+            logger.info(f"[RECONCILIATION LOOP #{cycle_num}] is_running={self.is_running}, platform={self.platform}")
+
             try:
                 if self.platform in ("waxpeer", "all"):
-                    logger.debug("  ├─ Collecte Waxpeer...")
+                    logger.info(f"[RECONCILIATION LOOP #{cycle_num}] ├─ Collecte Waxpeer...")
                     try:
                         await self._collect_waxpeer_sales(session)
+                        logger.info(f"[RECONCILIATION LOOP #{cycle_num}] ├─ Collecte Waxpeer ✓")
                     except Exception as e:
-                        logger.error(f"  ✗ Erreur collecte Waxpeer: {type(e).__name__}: {e}")
-                        # Continue même si Waxpeer fail
+                        logger.error(f"[RECONCILIATION LOOP #{cycle_num}] ✗ Erreur collecte Waxpeer: {type(e).__name__}: {e}", exc_info=True)
 
                 if self.platform in ("dmarket", "all"):
-                    logger.debug("  ├─ Collecte DMarket...")
+                    logger.info(f"[RECONCILIATION LOOP #{cycle_num}] ├─ Collecte DMarket...")
                     try:
                         await self._collect_dmarket_sales(session)
+                        logger.info(f"[RECONCILIATION LOOP #{cycle_num}] ├─ Collecte DMarket ✓")
                     except Exception as e:
-                        logger.error(f"  ✗ Erreur collecte DMarket: {type(e).__name__}: {e}")
-                        # Continue même si DMarket fail
+                        logger.error(f"[RECONCILIATION LOOP #{cycle_num}] ✗ Erreur collecte DMarket: {type(e).__name__}: {e}", exc_info=True)
 
-                logger.debug("  ├─ Réconciliation marketplace_sales...")
+                logger.info(f"[RECONCILIATION LOOP #{cycle_num}] ├─ Réconciliation marketplace_sales...")
                 matched = self.observer._db.reconcile_and_save(retention_days=7)
+                logger.info(f"[RECONCILIATION LOOP #{cycle_num}] ├─ Réconciliation marketplace_sales ✓ ({matched} matched)")
 
-                logger.debug("  └─ Cleanup données > 7j...")
+                logger.info(f"[RECONCILIATION LOOP #{cycle_num}] └─ Cleanup données > 7j...")
                 self.observer._db.cleanup_old_marketplace_data(days=7)
+                logger.info(f"[RECONCILIATION LOOP #{cycle_num}] └─ Cleanup ✓")
 
             except Exception as e:
-                logger.error(f"  ✗ Erreur critique réconciliation: {e}", exc_info=True)
+                logger.error(f"[RECONCILIATION LOOP #{cycle_num}] ✗ Erreur CRITIQUE dans le cycle: {type(e).__name__}: {e}", exc_info=True)
+                logger.error(f"[RECONCILIATION LOOP #{cycle_num}] is_running={self.is_running} après erreur")
 
             elapsed = time.perf_counter() - cycle_start
+            cycle_end_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
             logger.info(
-                f"✓ Réconciliation terminée : {matched} transactions HIGH en {elapsed:.1f}s."
+                f"[RECONCILIATION LOOP #{cycle_num}] ✓ Cycle complété à {cycle_end_iso}: "
+                f"{matched} transactions HIGH en {elapsed:.1f}s"
             )
+
             remaining = 3600 - elapsed
-            if remaining > 0:
-                logger.debug(f"  Prochain cycle dans {remaining:.0f}s...")
-            await asyncio.sleep(max(0, remaining))
+            logger.info(
+                f"[RECONCILIATION LOOP #{cycle_num}] ⏳ Sleep {remaining:.1f}s avant cycle #{cycle_num + 1}"
+            )
+
+            # Vérifier is_running avant le sleep
+            if not self.is_running:
+                logger.warning(f"[RECONCILIATION LOOP #{cycle_num}] ⚠️ is_running=False AVANT sleep, sortie immédiate")
+                break
+
+            try:
+                sleep_duration = max(0, remaining)
+                logger.info(f"[RECONCILIATION LOOP #{cycle_num}] Début sleep {sleep_duration:.1f}s...")
+                await asyncio.sleep(sleep_duration)
+                logger.info(f"[RECONCILIATION LOOP #{cycle_num}] Fin sleep ✓, prêt pour cycle #{cycle_num + 1}")
+            except asyncio.CancelledError as e:
+                logger.error(f"[RECONCILIATION LOOP #{cycle_num}] ✗ Sleep ANNULÉ (CancelledError): {e}")
+                break
+            except Exception as e:
+                logger.error(f"[RECONCILIATION LOOP #{cycle_num}] ✗ Erreur pendant sleep: {type(e).__name__}: {e}", exc_info=True)
+                logger.error(f"[RECONCILIATION LOOP #{cycle_num}] is_running={self.is_running}")
+                # Continuer même en cas d'erreur lors du sleep
+
+            # Vérifier is_running après le sleep
+            if not self.is_running:
+                logger.warning(f"[RECONCILIATION LOOP #{cycle_num}] ⚠️ is_running=False APRÈS sleep, sortie")
+                break
+
+        logger.warning(f"[RECONCILIATION LOOP] 🛑 Boucle arrêtée - is_running={self.is_running}, cycles complétés={cycle_num}")
 
     # ──────────────────────────────────────────────────────────────────────────
     # BOUCLE D'OBSERVATION MARKET.CSGO (WS + SNAPSHOT PARTIEL)
