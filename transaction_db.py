@@ -223,7 +223,11 @@ class TransactionDatabase:
                 if row:
                     try:
                         last_ts = datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00"))
-                        now_dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                        if last_ts.tzinfo is None:
+                            last_ts = last_ts.replace(tzinfo=timezone.utc)
+                        # Comparer contre l'heure courante réelle, pas le timestamp de la
+                        # transaction (qui peut être un sale_ts passé dans le path DMarket)
+                        now_dt = datetime.now(timezone.utc)
                         delta = now_dt - last_ts
                         if delta.total_seconds() < 86400:  # 24 heures
                             logger.warning(
