@@ -135,7 +135,6 @@ class TransactionDatabase:
                 # Index marketplace_sales
                 conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_dedup ON marketplace_sales (platform, market_hash_name, float_value, sale_ts);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_reconcile ON marketplace_sales (platform, market_hash_name, float_value);")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_unreconciled ON marketplace_sales (reconciled_at) WHERE reconciled_at IS NULL;")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_cleanup ON marketplace_sales (fetched_at);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_week ON skin_market_stats (week_label);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_skin ON skin_market_stats (market_hash_name);")
@@ -153,6 +152,11 @@ class TransactionDatabase:
                         conn.execute(migration)
                     except Exception:
                         pass
+                # Index partiel sur reconciled_at — doit être APRÈS la migration qui ajoute la colonne
+                try:
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_unreconciled ON marketplace_sales (reconciled_at) WHERE reconciled_at IS NULL;")
+                except Exception:
+                    pass
                 # Backfill original_listed_at = listed_at pour les rows existantes
                 conn.execute("""
                     UPDATE observed_listings
