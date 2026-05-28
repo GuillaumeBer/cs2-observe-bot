@@ -589,27 +589,35 @@ class MarketObserver:
             conn = self._db._get_connection()
             try:
                 listings = conn.execute("""
-                    SELECT platform, COUNT(*) as n
+                    SELECT platform,
+                      COUNT(*) as total,
+                      COUNT(DISTINCT market_hash_name) as unique_skins
                     FROM observed_listings GROUP BY platform
                 """).fetchall()
                 sales = conn.execute("""
-                    SELECT platform, COUNT(*) as n
+                    SELECT platform,
+                      COUNT(DISTINCT market_hash_name) as unique_skins
                     FROM marketplace_sales GROUP BY platform
                 """).fetchall()
                 transactions = conn.execute("""
                     SELECT platform, COUNT(*) as n
                     FROM transactions WHERE confidence='HIGH' GROUP BY platform
                 """).fetchall()
-                listings_by_plat = {r[0]: r[1] for r in listings}
+                listings_by_plat = {r[0]: (r[1], r[2]) for r in listings}
                 sales_by_plat = {r[0]: r[1] for r in sales}
                 tx_by_plat = {r[0]: r[1] for r in transactions}
                 all_platforms = sorted(set(list(listings_by_plat) + list(sales_by_plat)))
                 print("─" * 74)
                 for plat in all_platforms:
-                    l = listings_by_plat.get(plat, 0)
-                    s = sales_by_plat.get(plat, 0)
+                    total_l, unique_l = listings_by_plat.get(plat, (0, 0))
+                    unique_s = sales_by_plat.get(plat, 0)
                     t = tx_by_plat.get(plat, 0)
-                    print(f"   {plat.upper():<10} Listings: {l:>6} | Ventes brutes: {s:>7} | Transactions HIGH: {t:>5}")
+                    print(
+                        f"   {plat.upper():<10} "
+                        f"Listés: {unique_l:>5} skins uniques ({total_l} listings) | "
+                        f"Vendus: {unique_s:>5} skins uniques | "
+                        f"HIGH: {t:>5}"
+                    )
             finally:
                 conn.close()
         except Exception:
