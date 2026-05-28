@@ -150,31 +150,19 @@ class WaxpeerIngestor:
             return
 
         if event_type == "update":
-            # Reprixage : même item_id, nouveau prix
+            # Reprixage : même item_id, nouveau prix.
+            # L'événement Waxpeer ne contient aucun champ timestamp (vérifié sur l'API).
+            # time.time() est la seule approximation possible (précis à la latence réseau).
             data = payload[1]
             if isinstance(data, dict) and data.get("game") == "csgo":
-                # LOG TEMPORAIRE — inspecter tous les champs disponibles dans update
-                logger.info(f"[WAXPEER UPDATE RAW] keys={sorted(data.keys())} | data={data}")
                 item_id = str(data.get("item_id", ""))
                 price_raw = data.get("price", 0)
                 price_cents = round(price_raw / 10)
-                # Essayer d'extraire un timestamp natif de l'événement
-                raw_ts = (data.get("time") or data.get("updated_at") or data.get("listed_at")
-                          or data.get("timestamp") or data.get("date") or data.get("created_at"))
-                if raw_ts is not None:
-                    try:
-                        listed_at = float(raw_ts)
-                        if listed_at > 1e12:
-                            listed_at /= 1000.0
-                    except (ValueError, TypeError):
-                        listed_at = time.time()
-                else:
-                    listed_at = time.time()  # fallback si Waxpeer ne fournit pas de timestamp
                 if item_id and price_cents > 0 and self.on_updated:
                     self.on_updated({
                         "id": f"waxpeer_{item_id}",
                         "price_cents": price_cents,
-                        "listed_at": listed_at,
+                        "listed_at": time.time(),
                         "auto": data.get("auto", True),
                     })
             return
