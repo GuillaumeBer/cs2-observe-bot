@@ -1466,12 +1466,10 @@ class ObservationIngestor:
 
         def on_removed(data: dict):
             lid = data["id"]
-            # Retire de la mémoire et enfile dans la file de vérification (comme DMarket)
-            entry = self.observer.record_removal(lid, platform="waxpeer", auto_confirm=False)
-            if entry:
-                entry["confidence"] = "MEDIUM" if entry.get("ttd_from_listing") else "LOW"
-                self._enqueue_candidates([entry], "waxpeer")
-            # Nettoyage DB immédiat (on sait exactement quand l'item a disparu)
+            # auto_confirm=True : Waxpeer génère trop d'events removed pour passer par la
+            # file de vérification (rate-limit 0.5s → backlog 87min+). La vente est confirmée
+            # a posteriori par le deferred loop qui compare avec /v1/sales-history.
+            self.observer.record_removal(lid, platform="waxpeer", auto_confirm=True)
             self.observer._db.delete_observed_listings([lid])
 
         ingestor = WaxpeerIngestor(callback=on_new, on_removed=on_removed, on_updated=on_updated)
