@@ -1522,7 +1522,12 @@ class ObservationIngestor:
         """Récupère les dernières ventes DMarket par skin et les insère dans marketplace_sales."""
         import urllib.parse
         import yarl
-        skin_names = self.observer._db.get_active_skin_names_for_sales("dmarket")
+        # Seulement les 800 skins cibles — les non-cibles sont déjà gérés par
+        # _deferred_verification_loop. 800 × 0.2s = ~2.7 min, dans le budget horaire.
+        if self.target_skins:
+            skin_names = list(self.target_skins)
+        else:
+            skin_names = self.observer._db.get_active_skin_names_for_sales("dmarket", max_age_hours=6.0)
         if not skin_names:
             return 0
         now = time.time()
