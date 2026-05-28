@@ -228,35 +228,39 @@ class TransactionDatabase:
         if ref_price_usd is None:
             ref_price_usd = self._compute_ref_price(market_hash_name, before_timestamp=timestamp)
 
-        # 1. Vérification anti-empoisonnement par float identique récent
+        # 1. Vérification anti-doublon : même (float, sale_ts) déjà enregistré ?
+        # On compare le sale_ts de la nouvelle transaction avec ceux déjà en base.
+        # Un même item peut être vendu plusieurs fois mais jamais au même timestamp exact.
+        # Tolérance de 60s pour absorber d'éventuelles variations de représentation.
         if float_value is not None and float_value > 0:
-            query_check = """
-            SELECT timestamp FROM transactions 
-            WHERE market_hash_name = ? AND float_value = ? 
-            ORDER BY timestamp DESC LIMIT 1;
-            """
             conn = self._get_connection()
             try:
-                row = conn.execute(query_check, (market_hash_name, float_value)).fetchone()
-                if row:
+                sale_ts_dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                if sale_ts_dt.tzinfo is None:
+                    sale_ts_dt = sale_ts_dt.replace(tzinfo=timezone.utc)
+                # Chercher les transactions existantes pour ce (skin, float)
+                rows = conn.execute("""
+                    SELECT timestamp FROM transactions
+                    WHERE market_hash_name = ? AND float_value = ?
+                    ORDER BY timestamp DESC LIMIT 10;
+                """, (market_hash_name, float_value)).fetchall()
+                for row in rows:
                     try:
-                        last_ts = datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00"))
-                        if last_ts.tzinfo is None:
-                            last_ts = last_ts.replace(tzinfo=timezone.utc)
-                        # Comparer contre l'heure courante réelle, pas le timestamp de la
-                        # transaction (qui peut être un sale_ts passé dans le path DMarket)
-                        now_dt = datetime.now(timezone.utc)
-                        delta = now_dt - last_ts
-                        if delta.total_seconds() < 86400:  # 24 heures
+                        existing_ts = datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00"))
+                        if existing_ts.tzinfo is None:
+                            existing_ts = existing_ts.replace(tzinfo=timezone.utc)
+                        delta_s = abs((sale_ts_dt - existing_ts).total_seconds())
+                        if delta_s < 60:  # même vente (± 60s de tolérance)
                             logger.warning(
-                                f"Transaction ignorée (doublon de float récent / suspicion d'annulation) : "
-                                f"{market_hash_name} (float: {float_value}) - Dernier TS: {row['timestamp']}"
+                                f"Transaction ignorée (doublon exact sale_ts) : "
+                                f"{market_hash_name} (float: {float_value}) — "
+                                f"sale_ts={timestamp} déjà enregistré à {row['timestamp']} (delta={delta_s:.0f}s)"
                             )
                             return False
                     except Exception as parse_err:
-                        logger.error(f"Erreur lors du parsing du timestamp de vérification : {parse_err}")
+                        logger.error(f"Erreur parsing timestamp doublon : {parse_err}")
             except Exception as check_err:
-                logger.error(f"Erreur lors de la vérification anti-doublon de float : {check_err}")
+                logger.error(f"Erreur vérification anti-doublon : {check_err}")
             finally:
                 conn.close()
 
@@ -1038,7 +1042,8 @@ class TransactionDatabase:
                     s.price_usd,
                     s.sale_ts,
                     l.original_listed_at,
-                    (s.sale_ts - l.original_listed_at) * 1000 AS ttd_ms,
+                    l.listed_at,
+                    (s.sale_ts - l.listed_at) * 1000 AS ttd_ms,
                     l.platform,
                     l.paint_seed,
                     l.sticker_count,
@@ -1075,6 +1080,18 @@ class TransactionDatabase:
                     sticker_names = []
 
                 sale_ts_iso = datetime.fromtimestamp(row["sale_ts"], timezone.utc).isoformat()
+                listed_at_iso = datetime.fromtimestamp(row["listed_at"], timezone.utc).isoformat() if row["listed_at"] else "N/A"
+                original_listed_at_iso = datetime.fromtimestamp(row["original_listed_at"], timezone.utc).isoformat() if row["original_listed_at"] else "N/A"
+
+                logger.info(
+                    f"MATCH {row['platform'].upper()}: {row['market_hash_name']} | "
+                    f"float={row['float_value']:.6f} | prix=${row['price_usd']:.2f} | "
+                    f"listed_at(dernier prix)={listed_at_iso} | "
+                    f"original_listed_at={original_listed_at_iso} | "
+                    f"sale_ts={sale_ts_iso} | "
+                    f"TTD={ttd_ms/1000:.1f}s [{self._ttd_category(ttd_ms)}]"
+                )
+
                 ref_price = self._compute_ref_price(
                     row["market_hash_name"], before_timestamp=sale_ts_iso
                 )
