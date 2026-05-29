@@ -650,10 +650,12 @@ class TransactionDatabase:
                 )
             # Publier sur Redis pour le bot de trading
             if _REDIS_AVAILABLE:
-                ref_price, _ = self._compute_ref_price(
+                # On utilise uniquement les ventes réelles (pas suggested_price DMarket
+                # qui est systématiquement gonflé et génère de faux positifs)
+                ref_price, ref_confidence = self._compute_ref_price(
                     market_hash_name,
                     before_timestamp=timestamp,
-                    suggested_price_cents=suggested_price_cents,
+                    suggested_price_cents=None,
                 )
                 payload = json.dumps({
                     "listing_id": listing_id,
@@ -665,8 +667,8 @@ class TransactionDatabase:
                     "sticker_names": sticker_names or [],
                     "platform": platform,
                     "listed_at": listed_at,
-                    "suggested_price_cents": suggested_price_cents,
                     "ref_price_usd": ref_price,
+                    "ref_price_confidence": ref_confidence,
                 })
                 _redis_client.publish("cs2_listings", payload)
             return True
