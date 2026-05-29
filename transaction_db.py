@@ -249,6 +249,46 @@ class TransactionDatabase:
         finally:
             conn.close()
 
+    def _compute_ref_price_from_listings(
+        self,
+        market_hash_name: str,
+        platform: str,
+        exclude_listing_id: str,
+        min_listings: int = 5,
+    ) -> tuple[Optional[float], Optional[str]]:
+        """
+        Ref price = médiane des prix des listings ACTUELS du même skin (hors ce listing).
+        C'est la vraie référence marché : si un listing est sous la médiane actuelle,
+        c'est une vraie opportunité de sniping.
+        Retourne (median_price_usd, confidence) ou (None, None) si pas assez de listings.
+        """
+        conn = self._get_connection()
+        try:
+            rows = conn.execute("""
+                SELECT price_cents FROM observed_listings
+                WHERE market_hash_name = ?
+                  AND platform = ?
+                  AND listing_id != ?
+                ORDER BY price_cents ASC
+            """, (market_hash_name, platform, exclude_listing_id)).fetchall()
+
+            prices = [r[0] / 100.0 for r in rows]
+            n = len(prices)
+
+            if n < min_listings:
+                return None, None
+
+            # Médiane
+            median = prices[n // 2] if n % 2 else (prices[n // 2 - 1] + prices[n // 2]) / 2.0
+            confidence = "HIGH" if n >= 20 else "MEDIUM"
+            return median, confidence
+
+        except Exception as e:
+            logger.error(f"Erreur ref_price_from_listings pour {market_hash_name}: {e}")
+            return None, None
+        finally:
+            conn.close()
+
         return None
 
     def save_transaction(
@@ -650,12 +690,10 @@ class TransactionDatabase:
                 )
             # Publier sur Redis pour le bot de trading
             if _REDIS_AVAILABLE:
-                # On utilise uniquement les ventes réelles (pas suggested_price DMarket
-                # qui est systématiquement gonflé et génère de faux positifs)
-                ref_price, ref_confidence = self._compute_ref_price(
-                    market_hash_name,
-                    before_timestamp=timestamp,
-                    suggested_price_cents=None,
+                # Ref price = médiane des listings ACTUELS du même skin sur la même plateforme
+                # C'est la vraie référence marché : compare ce listing aux autres vendeurs maintenant
+                ref_price, ref_confidence = self._compute_ref_price_from_listings(
+                    market_hash_name, platform, listing_id
                 )
                 payload = json.dumps({
                     "listing_id": listing_id,
