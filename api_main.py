@@ -193,16 +193,17 @@ def get_global_stats(
               COUNT(DISTINCT market_hash_name) as unique_skins
             FROM observed_listings GROUP BY platform
         """).fetchall():
-            platform_stats[row[0]] = {"listings_total": row[1], "listings_unique_skins": row[2], "sales_unique_skins": 0, "transactions_high": 0}
+            platform_stats[row[0]] = {"listings_total": row[1], "listings_unique_skins": row[2], "sales_total": 0, "sales_unique_skins": 0, "transactions_high": 0}
 
         for row in conn.execute("""
-            SELECT platform, COUNT(DISTINCT market_hash_name) as n
+            SELECT platform, COUNT(*) as total, COUNT(DISTINCT market_hash_name) as unique_count
             FROM marketplace_sales GROUP BY platform
         """).fetchall():
             if row[0] in platform_stats:
-                platform_stats[row[0]]["sales_unique_skins"] = row[1]
+                platform_stats[row[0]]["sales_total"] = row[1]
+                platform_stats[row[0]]["sales_unique_skins"] = row[2]
             else:
-                platform_stats[row[0]] = {"listings_total": 0, "listings_unique_skins": 0, "sales_unique_skins": row[1], "transactions_high": 0}
+                platform_stats[row[0]] = {"listings_total": 0, "listings_unique_skins": 0, "sales_total": row[1], "sales_unique_skins": row[2], "transactions_high": 0}
 
         for row in conn.execute("""
             SELECT platform, COUNT(*) as n FROM transactions WHERE confidence='HIGH' GROUP BY platform
@@ -263,7 +264,7 @@ def get_transactions(
         query = """
         SELECT id, timestamp, market_hash_name, price_usd, float_value, paint_seed,
                sticker_count, sticker_names, (ttd_ms / 1000.0) AS ttd_seconds, platform, confidence,
-               ref_price_usd,
+               ref_price_usd, ref_price_confidence,
                CASE WHEN ref_price_usd IS NOT NULL AND ref_price_usd > 0
                     THEN (price_usd - ref_price_usd) / ref_price_usd * 100.0
                     ELSE NULL END AS discount_pct

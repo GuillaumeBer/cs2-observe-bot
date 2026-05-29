@@ -43,7 +43,8 @@ class TransactionDatabase:
             category TEXT NOT NULL,
             platform TEXT NOT NULL,
             confidence TEXT NOT NULL DEFAULT 'LOW',
-            ref_price_usd REAL
+            ref_price_usd REAL,
+            ref_price_confidence TEXT DEFAULT NULL
         );
         """
         query_opp = """
@@ -148,6 +149,7 @@ class TransactionDatabase:
                     "ALTER TABLE observed_listings ADD COLUMN original_listed_at REAL;",
                     "ALTER TABLE marketplace_sales ADD COLUMN reconciled_at REAL;",
                     "ALTER TABLE observed_listings ADD COLUMN suggested_price_cents INTEGER;",
+                    "ALTER TABLE transactions ADD COLUMN ref_price_confidence TEXT DEFAULT NULL;",
                 ]:
                     try:
                         conn.execute(migration)
@@ -176,27 +178,31 @@ class TransactionDatabase:
         before_timestamp: str,
         limit: int = 50,
         suggested_price_cents: Optional[int] = None,
-    ) -> Optional[float]:
+    ) -> tuple[Optional[float], Optional[str]]:
         """
-        Prix de référence hybride (3 sources par priorité) :
-          1. suggestedPrice DMarket (= prix Steam Market) si disponible et cohérent
-          2. Médiane des ventes marketplace_sales 7j (prix réel plateforme)
-          3. Médiane de nos propres transactions (fallback)
+        Prix de référence strict avec confiance (rejette LOW confidence).
+        Retourne: (price_usd, confidence_level)
+
+        Hiérarchie:
+          HIGH: suggestedPrice DMarket (Steam Market officiel)
+          MEDIUM: 10+ ventes marketplace_sales dans 2j, OU 5+ ventes dans 7j
+          REJECTED: < 5 ventes, ou fallback à nos transactions
         """
         DAY = 86400.0
 
-        # Source 1 : suggestedPrice DMarket (Steam Market)
+        # Source 1 : suggestedPrice DMarket (Steam Market) = HIGH confiance
         if suggested_price_cents and suggested_price_cents > 0:
-            return suggested_price_cents / 100.0
+            return suggested_price_cents / 100.0, "HIGH"
 
         conn = self._get_connection()
         try:
             before_ts = datetime.fromisoformat(
                 before_timestamp.replace("Z", "+00:00")
             ).timestamp()
+            cutoff_2d = before_ts - 2 * DAY
             cutoff_7d = before_ts - 7 * DAY
 
-            # Source 2 : marketplace_sales récentes (7j, fenêtre adaptative)
+            # Source 2 : marketplace_sales MEDIUM confiance (seuils stricts)
             rows = conn.execute("""
                 SELECT price_usd, sale_ts FROM marketplace_sales
                 WHERE market_hash_name = ?
@@ -205,29 +211,29 @@ class TransactionDatabase:
                 ORDER BY sale_ts DESC
             """, (market_hash_name, before_ts, cutoff_7d)).fetchall()
 
-            if len(rows) >= 3:
-                prices_2d = [r["price_usd"] for r in rows if before_ts - r["sale_ts"] < 2 * DAY]
-                prices = prices_2d if len(prices_2d) >= 10 else [r["price_usd"] for r in rows]
+            # Stratégie 2a : 10+ ventes dans 2j = MEDIUM (très bon)
+            prices_2d = [r["price_usd"] for r in rows if before_ts - r["sale_ts"] < 2 * DAY]
+            if len(prices_2d) >= 10:
+                prices_2d.sort()
+                n = len(prices_2d)
+                median_price = prices_2d[n // 2] if n % 2 else (prices_2d[n // 2 - 1] + prices_2d[n // 2]) / 2.0
+                return median_price, "MEDIUM"
+
+            # Stratégie 2b : 5+ ventes dans 7j = MEDIUM (acceptable)
+            if len(rows) >= 5:
+                prices = [r["price_usd"] for r in rows]
                 prices.sort()
                 n = len(prices)
-                return prices[n // 2] if n % 2 else (prices[n // 2 - 1] + prices[n // 2]) / 2.0
+                median_price = prices[n // 2] if n % 2 else (prices[n // 2 - 1] + prices[n // 2]) / 2.0
+                return median_price, "MEDIUM"
 
-            # Source 3 : nos propres transactions (fallback)
-            seuil_bot_ms = getattr(config, "OBS_BOT_SNIPE_TTD_MS", 5000)
-            rows2 = conn.execute("""
-                SELECT price_usd FROM transactions
-                WHERE market_hash_name = ? AND ttd_ms >= ? AND timestamp < ?
-                ORDER BY timestamp DESC LIMIT ?
-            """, (market_hash_name, seuil_bot_ms, before_timestamp, limit)).fetchall()
-
-            prices2 = [r["price_usd"] for r in rows2]
-            if len(prices2) >= 3:
-                prices2.sort()
-                n = len(prices2)
-                return prices2[n // 2] if n % 2 else (prices2[n // 2 - 1] + prices2[n // 2]) / 2.0
+            # Source 3 rejetée : fallback à nos transactions trop peu fiable
+            # (return None pour rejeter complètement)
+            return None, None
 
         except Exception as e:
             logger.error(f"Erreur calcul ref_price pour {market_hash_name} : {e}")
+            return None, None
         finally:
             conn.close()
 
@@ -260,8 +266,9 @@ class TransactionDatabase:
         if not float_value or float_value <= 0:
             return False
 
+        ref_price_confidence = None
         if ref_price_usd is None:
-            ref_price_usd = self._compute_ref_price(market_hash_name, before_timestamp=timestamp)
+            ref_price_usd, ref_price_confidence = self._compute_ref_price(market_hash_name, before_timestamp=timestamp)
 
         # 1. Vérification anti-doublon : même (float, sale_ts) déjà enregistré ?
         # On compare le sale_ts de la nouvelle transaction avec ceux déjà en base.
@@ -305,8 +312,8 @@ class TransactionDatabase:
         INSERT INTO transactions (
             timestamp, market_hash_name, price_usd, float_value,
             paint_seed, sticker_count, sticker_names, ttd_ms, category, platform, confidence,
-            ref_price_usd
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            ref_price_usd, ref_price_confidence
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         conn = self._get_connection()
         try:
@@ -326,6 +333,7 @@ class TransactionDatabase:
                         platform,
                         confidence,
                         ref_price_usd,
+                        ref_price_confidence,
                     )
                 )
             logger.debug(f"Transaction enregistrée pour {market_hash_name} à ${price_usd:.2f}")
@@ -879,7 +887,7 @@ class TransactionDatabase:
                     if already_sold:
                         continue
 
-                    ref_price_usd = self._compute_ref_price(market_hash_name, before_timestamp=now_str)
+                    ref_price_usd, ref_price_confidence = self._compute_ref_price(market_hash_name, before_timestamp=now_str)
 
                     try:
                         sticker_names = json.dumps(json.loads(r.get("sticker_names") or "[]"))
@@ -890,8 +898,8 @@ class TransactionDatabase:
                         INSERT INTO transactions (
                             timestamp, market_hash_name, price_usd, float_value,
                             paint_seed, sticker_count, sticker_names, ttd_ms,
-                            category, platform, confidence, ref_price_usd
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                            category, platform, confidence, ref_price_usd, ref_price_confidence
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """, (
                         now_str,
                         market_hash_name,
@@ -905,6 +913,7 @@ class TransactionDatabase:
                         r["platform"],
                         "LOW",
                         ref_price_usd,
+                        ref_price_confidence,
                     ))
                     saved_count += 1
 
@@ -1071,7 +1080,19 @@ class TransactionDatabase:
             max_window = retention_days * 86400
             now_ts = time.time()
             # Récupérer uniquement les ventes non encore réconciliées
+            # Optimisation : utiliser une window function (ROW_NUMBER) au lieu d'une sous-requête corrélée
+            # pour éviter l'exécution répétée de MAX() pour chaque vente (~25K)
             rows = conn.execute("""
+                WITH ranked_listings AS (
+                  SELECT
+                    l.*,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY l.platform, l.market_hash_name, l.float_value
+                      ORDER BY l.original_listed_at DESC
+                    ) as listing_rank
+                  FROM observed_listings l
+                  WHERE l.original_listed_at IS NOT NULL
+                )
                 SELECT
                     s.id            AS sale_id,
                     l.listing_id,
@@ -1090,27 +1111,18 @@ class TransactionDatabase:
                     l.sticker_count,
                     l.sticker_names
                 FROM marketplace_sales s
-                JOIN observed_listings l ON
+                JOIN ranked_listings l ON
                     l.platform = s.platform
                     AND l.market_hash_name = s.market_hash_name
                     AND l.float_value BETWEEN s.float_value - 0.0001 AND s.float_value + 0.0001
-                    AND l.original_listed_at IS NOT NULL
                     AND l.original_listed_at < s.sale_ts
                     AND l.original_listed_at > s.sale_ts - ?
                     AND COALESCE(l.listed_at, l.original_listed_at) <= s.sale_ts
-                    AND l.original_listed_at = (
-                        SELECT MAX(l2.original_listed_at)
-                        FROM observed_listings l2
-                        WHERE l2.platform = l.platform
-                          AND l2.market_hash_name = l.market_hash_name
-                          AND l2.float_value BETWEEN s.float_value - 0.0001 AND s.float_value + 0.0001
-                          AND l2.original_listed_at < s.sale_ts
-                          AND l2.original_listed_at > s.sale_ts - ?
-                    )
+                    AND l.listing_rank = 1
                 WHERE l.float_value IS NOT NULL
                   AND s.reconciled_at IS NULL
                 ORDER BY s.id
-            """, (max_window, max_window)).fetchall()
+            """, (max_window,)).fetchall()
 
             sale_ids_to_mark = []
 
@@ -1139,7 +1151,7 @@ class TransactionDatabase:
                     f"TTD={ttd_ms/1000:.1f}s [{self._ttd_category(ttd_ms)}]"
                 )
 
-                ref_price = self._compute_ref_price(
+                ref_price, ref_price_confidence = self._compute_ref_price(
                     row["market_hash_name"],
                     before_timestamp=sale_ts_iso,
                     suggested_price_cents=row["suggested_price_cents"],
