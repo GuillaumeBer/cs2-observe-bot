@@ -1105,7 +1105,7 @@ class TransactionDatabase:
                     ABS(l.price_cents - s.price_usd * 100) as price_diff_cents,
                     ROW_NUMBER() OVER (
                       PARTITION BY s.id
-                      ORDER BY ABS(l.float_value - s.float_value) ASC, ABS(l.price_cents - s.price_usd * 100) ASC
+                      ORDER BY ABS(l.float_value - s.float_value) ASC, ABS(l.price_cents - s.price_usd * 100) ASC, l.listing_id ASC
                     ) as match_rank
                   FROM marketplace_sales s
                   JOIN observed_listings l ON
