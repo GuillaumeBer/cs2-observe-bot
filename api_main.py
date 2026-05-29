@@ -494,6 +494,127 @@ def get_ml_stats():
     }
 
 
+TRADING_DB_PATH = os.path.join(os.path.dirname(config.OBSERVER_DB_PATH), "..", "cs2-trading-bot", "data", "trading.db")
+
+def get_trading_db_connection():
+    """Connexion read-only à la DB du bot de trading."""
+    db_path = os.path.abspath(TRADING_DB_PATH)
+    if not os.path.exists(db_path):
+        return None
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@app.get("/api/signals")
+def get_signals(limit: int = Query(100, ge=1, le=500)):
+    """Signaux GO/WATCH détectés par le bot de trading.
+    Pour chaque signal GO, vérifie si une vente a eu lieu dans l'heure suivante."""
+    trading_conn = get_trading_db_connection()
+    if trading_conn is None:
+        return {"signals": [], "error": "Trading bot DB not found"}
+    obs_conn = get_db_connection()
+    try:
+        rows = trading_conn.execute("""
+            SELECT detected_at, platform, listing_id, market_hash_name,
+                   float_value, price_usd, ref_price_usd, discount_pct,
+                   predicted_ttd_h, decision, sticker_count
+            FROM signals
+            ORDER BY detected_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+
+        signals = []
+        for r in rows:
+            confirmed_sale = None
+            confirmed_ttd_h = None
+
+            # Pour tous les signaux, cherche une vente dans l'heure suivante
+            if r["float_value"]:
+                from datetime import datetime as dt, timezone as tz
+                try:
+                    detected_ts = dt.fromisoformat(r["detected_at"].replace("Z", "+00:00")).timestamp()
+                    window_end = detected_ts + 3600  # 1h après détection
+                    sale = obs_conn.execute("""
+                        SELECT sale_ts, price_usd FROM marketplace_sales
+                        WHERE market_hash_name = ?
+                          AND platform = ?
+                          AND ABS(float_value - ?) < 0.000001
+                          AND sale_ts BETWEEN ? AND ?
+                        ORDER BY sale_ts ASC
+                        LIMIT 1
+                    """, (r["market_hash_name"], r["platform"], r["float_value"],
+                          detected_ts, window_end)).fetchone()
+                    if sale:
+                        confirmed_sale = True
+                        confirmed_ttd_h = (sale["sale_ts"] - detected_ts) / 3600
+                except Exception:
+                    pass
+
+            signals.append({
+                "detected_at": r["detected_at"],
+                "platform": r["platform"],
+                "listing_id": r["listing_id"],
+                "market_hash_name": r["market_hash_name"],
+                "float_value": r["float_value"],
+                "price_usd": r["price_usd"],
+                "ref_price_usd": r["ref_price_usd"],
+                "discount_pct": round(r["discount_pct"] or 0, 1),
+                "predicted_ttd_h": round(r["predicted_ttd_h"], 2) if r["predicted_ttd_h"] else None,
+                "decision": r["decision"],
+                "sticker_count": r["sticker_count"],
+                "confirmed_sale": confirmed_sale,
+                "confirmed_ttd_h": round(confirmed_ttd_h, 2) if confirmed_ttd_h else None,
+            })
+
+        # Ventes récentes (1h glissante) avec flag "détecté par le bot"
+        from datetime import datetime as dt, timezone as tz
+        now_ts = dt.now(tz.utc).timestamp()
+        recent_sales = obs_conn.execute("""
+            SELECT market_hash_name, platform, float_value, price_usd, sale_ts
+            FROM marketplace_sales
+            WHERE sale_ts > ? AND float_value IS NOT NULL
+            ORDER BY sale_ts DESC
+            LIMIT 200
+        """, (now_ts - 3600,)).fetchall()
+
+        sales_with_detection = []
+        for sale in recent_sales:
+            # Cherche si le bot a émis un signal dans l'heure avant la vente
+            signal = trading_conn.execute("""
+                SELECT decision, predicted_ttd_h, discount_pct
+                FROM signals
+                WHERE market_hash_name = ?
+                  AND platform = ?
+                  AND ABS(float_value - ?) < 0.000001
+                  AND detected_at BETWEEN datetime(?, 'unixepoch', '-3600 seconds') AND datetime(?, 'unixepoch')
+                ORDER BY detected_at DESC
+                LIMIT 1
+            """, (sale["market_hash_name"], sale["platform"], sale["float_value"],
+                  sale["sale_ts"], sale["sale_ts"])).fetchone()
+
+            sales_with_detection.append({
+                "market_hash_name": sale["market_hash_name"],
+                "platform": sale["platform"],
+                "float_value": sale["float_value"],
+                "price_usd": sale["price_usd"],
+                "sale_ts": sale["sale_ts"],
+                "detected_by_bot": signal is not None,
+                "bot_decision": signal["decision"] if signal else None,
+                "bot_predicted_ttd_h": round(signal["predicted_ttd_h"], 2) if signal and signal["predicted_ttd_h"] else None,
+                "bot_discount_pct": round(signal["discount_pct"], 1) if signal and signal["discount_pct"] else None,
+            })
+
+        return {
+            "total": len(signals),
+            "signals": signals,
+            "recent_sales": sales_with_detection,
+        }
+    finally:
+        trading_conn.close()
+        obs_conn.close()
+
+
 if __name__ == "__main__":
     # Démarrage sur le port 8000 sur toutes les interfaces réseau (0.0.0.0)
     uvicorn.run("api_main:app", host="0.0.0.0", port=8000, reload=False)
