@@ -566,10 +566,9 @@ def get_signals(limit: int = Query(100, ge=1, le=500)):
                 "sticker_count": r["sticker_count"],
                 "confirmed_sale": confirmed_sale,
                 "confirmed_ttd_h": round(confirmed_ttd_h, 2) if confirmed_ttd_h else None,
-                "detection_delay_s": round(
-                    (dt.fromisoformat(r["detected_at"].replace("Z", "+00:00")).timestamp() - r["listed_at"])
-                    if r["listed_at"] else None
-                ) if r["listed_at"] else None,
+                "detection_delay_s": max(0, round(
+                    dt.fromisoformat(r["detected_at"].replace("Z", "+00:00")).timestamp() - r["listed_at"]
+                )) if r["listed_at"] else None,
             })
 
         # Ventes récentes (1h glissante) avec flag "détecté par le bot"
