@@ -281,7 +281,8 @@ class TransactionDatabase:
 
             if n < min_listings:
                 return {"ref_price": None, "confidence": None, "n_listings": n,
-                        "price_percentile": 0.0, "price_cv": 0.0}
+                        "price_percentile": 0.0, "price_cv": 0.0,
+                        "resell_discount_pct": 0.0, "resell_price_percentile": 0.0}
 
             # P10 : le bas du marché (médian trop influencé par les listings stales/surcotés)
             p10 = prices[max(0, n // 10)]
@@ -296,13 +297,22 @@ class TransactionDatabase:
             var = sum((p - mean_p) ** 2 for p in prices) / n
             cv = (var ** 0.5) / mean_p if mean_p > 0 else 0.0
 
+            # Scénario REVENTE à +10% : où se situerait notre prix de revente ?
+            resell_price = price_usd * 1.10
+            resell_discount_pct = (p10 - resell_price) / p10 * 100 if p10 > 0 else 0
+            below_resell = sum(1 for p in prices if p < resell_price)
+            resell_percentile = below_resell / n * 100.0
+
             return {"ref_price": p10, "confidence": confidence, "n_listings": n,
-                    "price_percentile": round(price_percentile, 2), "price_cv": round(cv, 4)}
+                    "price_percentile": round(price_percentile, 2), "price_cv": round(cv, 4),
+                    "resell_discount_pct": round(resell_discount_pct, 2),
+                    "resell_price_percentile": round(resell_percentile, 2)}
 
         except Exception as e:
             logger.error(f"Erreur _compute_listing_features pour {market_hash_name}: {e}")
             return {"ref_price": None, "confidence": None, "n_listings": 0,
-                    "price_percentile": 0.0, "price_cv": 0.0}
+                    "price_percentile": 0.0, "price_cv": 0.0,
+                    "resell_discount_pct": 0.0, "resell_price_percentile": 0.0}
         finally:
             conn.close()
 
@@ -743,6 +753,8 @@ class TransactionDatabase:
                     "price_percentile": feats["price_percentile"],
                     "price_cv": feats["price_cv"],
                     "sales_volume": sales_volume,
+                    "resell_discount_pct": feats["resell_discount_pct"],
+                    "resell_price_percentile": feats["resell_price_percentile"],
                 })
                 _redis_client.publish("cs2_listings", payload)
             return True

@@ -518,7 +518,7 @@ def get_signals(limit: int = Query(100, ge=1, le=500)):
         rows = trading_conn.execute("""
             SELECT detected_at, listed_at, platform, listing_id, market_hash_name,
                    float_value, price_usd, ref_price_usd, discount_pct,
-                   predicted_ttd_h, decision, sticker_count
+                   predicted_ttd_h, predicted_ttd_resell_h, decision, sticker_count
             FROM signals
             ORDER BY detected_at DESC
             LIMIT ?
@@ -561,6 +561,7 @@ def get_signals(limit: int = Query(100, ge=1, le=500)):
                 "ref_price_usd": r["ref_price_usd"],
                 "discount_pct": round(r["discount_pct"] or 0, 1),
                 "predicted_ttd_h": round(r["predicted_ttd_h"], 2) if r["predicted_ttd_h"] else None,
+                "predicted_ttd_resell_h": round(r["predicted_ttd_resell_h"], 2) if r["predicted_ttd_resell_h"] else None,
                 "decision": r["decision"],
                 "sticker_count": r["sticker_count"],
                 "confirmed_sale": confirmed_sale,
