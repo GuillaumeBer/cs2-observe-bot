@@ -1111,7 +1111,7 @@ class TransactionDatabase:
                   JOIN observed_listings l ON
                     l.platform = s.platform
                     AND l.market_hash_name = s.market_hash_name
-                    AND ABS(l.float_value - s.float_value) <= 0.0001
+                    AND ABS(l.float_value - s.float_value) <= 0.00005
                     AND l.original_listed_at < s.sale_ts
                     AND l.original_listed_at > s.sale_ts - ?
                     AND COALESCE(l.listed_at, l.original_listed_at) <= s.sale_ts
