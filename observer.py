@@ -454,18 +454,20 @@ class MarketObserver:
         if not float_value or float_value <= 0:
             logger.warning(f"SKIP_NO_FLOAT: {market_hash_name} fv={float_value!r} platform={platform}")
             return
-        self._db.save_transaction(
-            market_hash_name=market_hash_name,
-            price_usd=price_usd,
-            ttd_ms=ttd_ms,
-            platform=platform,
-            category=category,
-            float_value=float_value,
-            paint_seed=paint_seed,
-            sticker_count=sticker_count,
-            sticker_names=sticker_names,
-            confidence=confidence,
-        )
+        # Désactivé : matching temps réel generic
+        # Les ventes seront réconciliées via reconcile_and_save() pour garantir une couverture complète
+        # self._db.save_transaction(
+        #     market_hash_name=market_hash_name,
+        #     price_usd=price_usd,
+        #     ttd_ms=ttd_ms,
+        #     platform=platform,
+        #     category=category,
+        #     float_value=float_value,
+        #     paint_seed=paint_seed,
+        #     sticker_count=sticker_count,
+        #     sticker_names=sticker_names,
+        #     confidence=confidence,
+        # )
 
     def _update_hot_item(
         self,

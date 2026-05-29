@@ -206,19 +206,21 @@ async def reconcile_skin(session: aiohttp.ClientSession, market_hash_name: str) 
             sn = matched_listing.get("sticker_names")
             sticker_names = sn if isinstance(sn, list) else []
 
-            saved = db.save_transaction(
-                market_hash_name=market_hash_name,
-                price_usd=sale["price_usd"],
-                ttd_ms=ttd_ms,
-                platform="dmarket",
-                category=category,
-                float_value=sale["float_value"],
-                paint_seed=sale["paint_seed"],
-                sticker_count=matched_listing.get("sticker_count", 0),
-                sticker_names=sticker_names,
-                timestamp=sale_timestamp_str,
-                confidence=confidence
-            )
+            # Désactivé : batch script reconciliation
+            # Les ventes seront réconciliées via reconcile_and_save() dans la boucle principale
+            # saved = db.save_transaction(
+            #     market_hash_name=market_hash_name,
+            #     price_usd=sale["price_usd"],
+            #     ttd_ms=ttd_ms,
+            #     platform="dmarket",
+            #     category=category,
+            #     float_value=sale["float_value"],
+            #     paint_seed=sale["paint_seed"],
+            #     sticker_count=matched_listing.get("sticker_count", 0),
+            #     sticker_names=sticker_names,
+            #     timestamp=sale_timestamp_str,
+            #     confidence=confidence
+            # )
 
             if saved:
                 logger.info(

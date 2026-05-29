@@ -474,20 +474,23 @@ class ObservationIngestor:
                                             sale_ts_iso = datetime.fromtimestamp(sale_ts, timezone.utc).isoformat().replace("+00:00", "Z")
                                             ref_price = _compute_ref_price_from_sales(sales, time.time())
 
-                                            saved = self.observer._db.save_transaction(
-                                                market_hash_name=skin_name,
-                                                price_usd=item_price_usd,
-                                                ttd_ms=ttd_ms,
-                                                platform="dmarket",
-                                                category=category,
-                                                float_value=item["float_value"],
-                                                paint_seed=item["paint_seed"],
-                                                sticker_count=item["sticker_count"],
-                                                sticker_names=sticker_names,
-                                                timestamp=sale_ts_iso,
-                                                confidence=confidence,
-                                                ref_price_usd=ref_price,
-                                            )
+                                            # Désactivé : matching temps réel
+                                            # Les ventes DMarket seront réconciliées via reconcile_and_save()
+                                            # pour garantir une couverture complète et éviter les doublons
+                                            # saved = self.observer._db.save_transaction(
+                                            #     market_hash_name=skin_name,
+                                            #     price_usd=item_price_usd,
+                                            #     ttd_ms=ttd_ms,
+                                            #     platform="dmarket",
+                                            #     category=category,
+                                            #     float_value=item["float_value"],
+                                            #     paint_seed=item["paint_seed"],
+                                            #     sticker_count=item["sticker_count"],
+                                            #     sticker_names=sticker_names,
+                                            #     timestamp=sale_ts_iso,
+                                            #     confidence=confidence,
+                                            #     ref_price_usd=ref_price,
+                                            # )
 
                                             # P2 : log et nettoyage seulement si le save a réussi
                                             if saved:
@@ -653,19 +656,21 @@ class ObservationIngestor:
                                                 f"Catégorie: {category} | Confidence: HIGH"
                                             )
 
-                                            self.observer._db.save_transaction(
-                                                market_hash_name=skin_name,
-                                                price_usd=item_price_usd,
-                                                ttd_ms=ttd_ms,
-                                                platform="csfloat",
-                                                category=category,
-                                                float_value=item["float_value"],
-                                                paint_seed=item["paint_seed"],
-                                                sticker_count=item["sticker_count"],
-                                                sticker_names=sticker_names,
-                                                timestamp=datetime.fromtimestamp(sale_ts, timezone.utc).isoformat(),
-                                                confidence="HIGH",
-                                            )
+                                            # Désactivé : matching temps réel CSFloat
+                                            # Les ventes CSFloat seront réconciliées via reconcile_and_save()
+                                            # self.observer._db.save_transaction(
+                                            #     market_hash_name=skin_name,
+                                            #     price_usd=item_price_usd,
+                                            #     ttd_ms=ttd_ms,
+                                            #     platform="csfloat",
+                                            #     category=category,
+                                            #     float_value=item["float_value"],
+                                            #     paint_seed=item["paint_seed"],
+                                            #     sticker_count=item["sticker_count"],
+                                            #     sticker_names=sticker_names,
+                                            #     timestamp=datetime.fromtimestamp(sale_ts, timezone.utc).isoformat(),
+                                            #     confidence="HIGH",
+                                            # )
 
                                             # Au lieu de supprimer juste un listing_id, on supprime TOUTES les entrées de cet item
                                             # antérieures à la date de vente (avec le delta d'erreur de 1.5s géré par la DB).
@@ -1956,18 +1961,20 @@ class ObservationIngestor:
                                             f"Catégorie: {category} | Confidence: {confidence}"
                                         )
 
-                                        self.observer._db.save_transaction(
-                                            market_hash_name=skin_name,
-                                            price_usd=candidate_price_usd,
-                                            ttd_ms=ttd_ms,
-                                            platform="market_csgo",
-                                            category=category,
-                                            float_value=item["float_value"],
-                                            paint_seed=item["paint_seed"],
-                                            sticker_count=item["sticker_count"],
-                                            sticker_names=sticker_names,
-                                            confidence=confidence,
-                                        )
+                                        # Désactivé : matching temps réel Market.CSGO
+                                        # Les ventes Market.CSGO seront réconciliées via reconcile_and_save()
+                                        # self.observer._db.save_transaction(
+                                        #     market_hash_name=skin_name,
+                                        #     price_usd=candidate_price_usd,
+                                        #     ttd_ms=ttd_ms,
+                                        #     platform="market_csgo",
+                                        #     category=category,
+                                        #     float_value=item["float_value"],
+                                        #     paint_seed=item["paint_seed"],
+                                        #     sticker_count=item["sticker_count"],
+                                        #     sticker_names=sticker_names,
+                                        #     confidence=confidence,
+                                        # )
                                         sold_ids.append(item["listing_id"])
                                         matched_count += 1
 
@@ -2133,18 +2140,20 @@ class ObservationIngestor:
                 f"TTD: {ttd_ms / 1000:.1f}s | Catégorie: {category} | Confidence: HIGH"
             )
 
-            self.observer._db.save_transaction(
-                market_hash_name=market_hash_name,
-                price_usd=price_cents / 100.0,
-                ttd_ms=ttd_ms,
-                platform="skinport",
-                category=category,
-                float_value=float_value,
-                paint_seed=paint_seed,
-                sticker_count=sticker_count,
-                sticker_names=sticker_names,
-                confidence="HIGH",
-            )
+            # Désactivé : matching temps réel Skinport
+            # Les ventes Skinport seront réconciliées via reconcile_and_save()
+            # self.observer._db.save_transaction(
+            #     market_hash_name=market_hash_name,
+            #     price_usd=price_cents / 100.0,
+            #     ttd_ms=ttd_ms,
+            #     platform="skinport",
+            #     category=category,
+            #     float_value=float_value,
+            #     paint_seed=paint_seed,
+            #     sticker_count=sticker_count,
+            #     sticker_names=sticker_names,
+            #     confidence="HIGH",
+            # )
             self.observer._db.delete_observed_listings([listing_id])
 
         if use_playwright:
