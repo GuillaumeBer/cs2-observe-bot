@@ -611,7 +611,8 @@ def get_signals(limit: int = Query(100, ge=1, le=500)):
             """, (sale["market_hash_name"], sale["platform"], sale["float_value"],
                   sale["price_usd"], sale["price_usd"])).fetchone()
 
-            real_ttd_h = round(tx["ttd_ms"] / 3600000, 2) if tx and tx["ttd_ms"] is not None else None
+            real_ttd_h = round(tx["ttd_ms"] / 3600000, 4) if tx and tx["ttd_ms"] is not None else None
+            real_ttd_s = round(tx["ttd_ms"] / 1000) if tx and tx["ttd_ms"] is not None else None
 
             sales_with_detection.append({
                 "market_hash_name": sale["market_hash_name"],
@@ -624,6 +625,7 @@ def get_signals(limit: int = Query(100, ge=1, le=500)):
                 "bot_predicted_ttd_h": round(signal["predicted_ttd_h"], 2) if signal and signal["predicted_ttd_h"] else None,
                 "bot_discount_pct": round(signal["discount_pct"], 1) if signal and signal["discount_pct"] else None,
                 "real_ttd_h": real_ttd_h,
+                "real_ttd_s": real_ttd_s,
             })
 
         return {
