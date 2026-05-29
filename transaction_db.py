@@ -695,6 +695,13 @@ class TransactionDatabase:
                 ref_price, ref_confidence = self._compute_ref_price_from_listings(
                     market_hash_name, platform, listing_id
                 )
+                # Nombre de listings concurrents (feature ML)
+                n_listings_row = conn.execute(
+                    "SELECT COUNT(*) FROM observed_listings WHERE market_hash_name=? AND platform=? AND listing_id!=?",
+                    (market_hash_name, platform, listing_id)
+                ).fetchone()
+                n_listings = n_listings_row[0] if n_listings_row else 0
+
                 payload = json.dumps({
                     "listing_id": listing_id,
                     "market_hash_name": market_hash_name,
@@ -707,6 +714,7 @@ class TransactionDatabase:
                     "listed_at": listed_at,
                     "ref_price_usd": ref_price,
                     "ref_price_confidence": ref_confidence,
+                    "n_listings": n_listings,
                 })
                 _redis_client.publish("cs2_listings", payload)
             return True
