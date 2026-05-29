@@ -584,17 +584,17 @@ def get_signals(limit: int = Query(100, ge=1, le=500)):
 
         sales_with_detection = []
         for sale in recent_sales:
-            # Cherche si le bot a émis un signal dans l'heure avant la vente
+            # Cherche si le bot a émis un signal pour ce skin dans la dernière heure
+            # Matching par market_hash_name + platform (fiable car c'est l'ID du skin)
             signal = trading_conn.execute("""
                 SELECT decision, predicted_ttd_h, discount_pct
                 FROM signals
                 WHERE market_hash_name = ?
                   AND platform = ?
-                  AND ABS(float_value - ?) < 0.000001
                   AND detected_at BETWEEN datetime(?, 'unixepoch', '-3600 seconds') AND datetime(?, 'unixepoch')
                 ORDER BY detected_at DESC
                 LIMIT 1
-            """, (sale["market_hash_name"], sale["platform"], sale["float_value"],
+            """, (sale["market_hash_name"], sale["platform"],
                   sale["sale_ts"], sale["sale_ts"])).fetchone()
 
             # TTD réel depuis transactions (vente réconciliée avec listing observé)
