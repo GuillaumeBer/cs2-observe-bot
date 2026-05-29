@@ -1079,9 +1079,18 @@ class TransactionDatabase:
         try:
             max_window = retention_days * 86400
             now_ts = time.time()
-            # Récupérer uniquement les ventes non encore réconciliées
-            # Optimisation : utiliser une window function (ROW_NUMBER) au lieu d'une sous-requête corrélée
-            # pour éviter l'exécution répétée de MAX() pour chaque vente (~25K)
+
+            unmatched_count = conn.execute(
+                "SELECT COUNT(*) FROM marketplace_sales WHERE reconciled_at IS NULL"
+            ).fetchone()[0]
+            listings_count = conn.execute(
+                "SELECT COUNT(*) FROM observed_listings WHERE float_value IS NOT NULL"
+            ).fetchone()[0]
+            logger.info(
+                f"[RECONCILIATION] Démarrage — ventes non-matchées: {unmatched_count}, "
+                f"listings avec float: {listings_count}, fenêtre: {retention_days}j"
+            )
+
             rows = conn.execute("""
                 WITH match_candidates AS (
                   SELECT
@@ -1127,6 +1136,8 @@ class TransactionDatabase:
                 WHERE match_rank = 1
                 ORDER BY sale_id
             """, (max_window,)).fetchall()
+
+            logger.info(f"[RECONCILIATION] Requête SQL — {len(rows)} matches exacts trouvés (float = float, prix = prix)")
 
             sale_ids_to_mark = []
 
@@ -1188,8 +1199,12 @@ class TransactionDatabase:
                         sale_ids_to_mark
                     )
 
+            logger.info(
+                f"[RECONCILIATION] Terminé — {matched} transactions créées sur {len(rows)} matches"
+            )
+
         except Exception as e:
-            logger.error(f"Erreur reconcile_and_save: {e}")
+            logger.error(f"Erreur reconcile_and_save: {e}", exc_info=True)
         finally:
             conn.close()
         return matched
