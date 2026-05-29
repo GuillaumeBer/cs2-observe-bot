@@ -253,6 +253,7 @@ class TransactionDatabase:
         timestamp: Optional[str] = None,
         confidence: str = "LOW",
         ref_price_usd: Optional[float] = None,
+        ref_price_confidence: Optional[str] = None,
     ) -> bool:
         """
         Enregistre une transaction détectée dans la base de données.
@@ -266,7 +267,6 @@ class TransactionDatabase:
         if not float_value or float_value <= 0:
             return False
 
-        ref_price_confidence = None
         if ref_price_usd is None:
             ref_price_usd, ref_price_confidence = self._compute_ref_price(market_hash_name, before_timestamp=timestamp)
 
@@ -1185,6 +1185,7 @@ class TransactionDatabase:
                     timestamp=sale_ts_iso,
                     confidence="HIGH",
                     ref_price_usd=ref_price,
+                    ref_price_confidence=ref_price_confidence,
                 )
                 # Marquer la vente comme réconciliée (on ne supprime pas, cleanup 7j s'en charge)
                 # Les observed_listings ne sont pas supprimés non plus
