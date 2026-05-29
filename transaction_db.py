@@ -278,10 +278,12 @@ class TransactionDatabase:
             if n < min_listings:
                 return None, None
 
-            # Médiane
-            median = prices[n // 2] if n % 2 else (prices[n // 2 - 1] + prices[n // 2]) / 2.0
+            # P10 (10ème percentile) : le bas du marché actuel.
+            # Le médian est trop influencé par les listings stales/surcotés.
+            # Un listing en dessous du P10 est genuinement le moins cher du marché.
+            p10 = prices[max(0, n // 10)]
             confidence = "HIGH" if n >= 20 else "MEDIUM"
-            return median, confidence
+            return p10, confidence
 
         except Exception as e:
             logger.error(f"Erreur ref_price_from_listings pour {market_hash_name}: {e}")
