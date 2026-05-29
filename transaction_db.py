@@ -650,7 +650,11 @@ class TransactionDatabase:
                 )
             # Publier sur Redis pour le bot de trading
             if _REDIS_AVAILABLE:
-                ref_price, _ = self._compute_ref_price(market_hash_name)
+                ref_price, _ = self._compute_ref_price(
+                    market_hash_name,
+                    before_timestamp=timestamp,
+                    suggested_price_cents=suggested_price_cents,
+                )
                 payload = json.dumps({
                     "listing_id": listing_id,
                     "market_hash_name": market_hash_name,
