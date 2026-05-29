@@ -249,18 +249,22 @@ class TransactionDatabase:
         finally:
             conn.close()
 
-    def _compute_ref_price_from_listings(
+    def _compute_listing_features(
         self,
         market_hash_name: str,
         platform: str,
         exclude_listing_id: str,
+        price_usd: float,
         min_listings: int = 5,
-    ) -> tuple[Optional[float], Optional[str]]:
+    ) -> dict:
         """
-        Ref price = médiane des prix des listings ACTUELS du même skin (hors ce listing).
-        C'est la vraie référence marché : si un listing est sous la médiane actuelle,
-        c'est une vraie opportunité de sniping.
-        Retourne (median_price_usd, confidence) ou (None, None) si pas assez de listings.
+        Calcule en une passe toutes les features dérivées des listings ACTUELS
+        du même skin (hors ce listing) :
+          - ref_price (P10) + confidence : le bas du marché actuel
+          - n_listings : nombre de concurrents
+          - price_percentile : position exacte du prix dans la distribution (0-100)
+          - price_cv : coefficient de variation (détecte les marchés bimodaux)
+        Retourne un dict ; ref_price=None si pas assez de listings.
         """
         conn = self._get_connection()
         try:
@@ -276,18 +280,43 @@ class TransactionDatabase:
             n = len(prices)
 
             if n < min_listings:
-                return None, None
+                return {"ref_price": None, "confidence": None, "n_listings": n,
+                        "price_percentile": 0.0, "price_cv": 0.0}
 
-            # P10 (10ème percentile) : le bas du marché actuel.
-            # Le médian est trop influencé par les listings stales/surcotés.
-            # Un listing en dessous du P10 est genuinement le moins cher du marché.
+            # P10 : le bas du marché (médian trop influencé par les listings stales/surcotés)
             p10 = prices[max(0, n // 10)]
             confidence = "HIGH" if n >= 20 else "MEDIUM"
-            return p10, confidence
+
+            # Percentile exact du prix de ce listing dans la distribution
+            below = sum(1 for p in prices if p < price_usd)
+            price_percentile = below / n * 100.0
+
+            # Coefficient de variation (dispersion) — détecte les marchés bimodaux
+            mean_p = sum(prices) / n
+            var = sum((p - mean_p) ** 2 for p in prices) / n
+            cv = (var ** 0.5) / mean_p if mean_p > 0 else 0.0
+
+            return {"ref_price": p10, "confidence": confidence, "n_listings": n,
+                    "price_percentile": round(price_percentile, 2), "price_cv": round(cv, 4)}
 
         except Exception as e:
-            logger.error(f"Erreur ref_price_from_listings pour {market_hash_name}: {e}")
-            return None, None
+            logger.error(f"Erreur _compute_listing_features pour {market_hash_name}: {e}")
+            return {"ref_price": None, "confidence": None, "n_listings": 0,
+                    "price_percentile": 0.0, "price_cv": 0.0}
+        finally:
+            conn.close()
+
+    def _get_sales_volume(self, market_hash_name: str, platform: str) -> int:
+        """Volume de ventes observées pour ce skin (proxy de liquidité réelle)."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM marketplace_sales WHERE market_hash_name=? AND platform=?",
+                (market_hash_name, platform)
+            ).fetchone()
+            return row[0] if row else 0
+        except Exception:
+            return 0
         finally:
             conn.close()
 
@@ -692,17 +721,11 @@ class TransactionDatabase:
                 )
             # Publier sur Redis pour le bot de trading
             if _REDIS_AVAILABLE:
-                # Ref price = médiane des listings ACTUELS du même skin sur la même plateforme
-                # C'est la vraie référence marché : compare ce listing aux autres vendeurs maintenant
-                ref_price, ref_confidence = self._compute_ref_price_from_listings(
-                    market_hash_name, platform, listing_id
+                # Features dérivées des listings actuels du même skin (ref P10, dispersion, percentile)
+                feats = self._compute_listing_features(
+                    market_hash_name, platform, listing_id, price_cents / 100.0
                 )
-                # Nombre de listings concurrents (feature ML)
-                n_listings_row = conn.execute(
-                    "SELECT COUNT(*) FROM observed_listings WHERE market_hash_name=? AND platform=? AND listing_id!=?",
-                    (market_hash_name, platform, listing_id)
-                ).fetchone()
-                n_listings = n_listings_row[0] if n_listings_row else 0
+                sales_volume = self._get_sales_volume(market_hash_name, platform)
 
                 payload = json.dumps({
                     "listing_id": listing_id,
@@ -714,9 +737,12 @@ class TransactionDatabase:
                     "sticker_names": sticker_names or [],
                     "platform": platform,
                     "listed_at": listed_at,
-                    "ref_price_usd": ref_price,
-                    "ref_price_confidence": ref_confidence,
-                    "n_listings": n_listings,
+                    "ref_price_usd": feats["ref_price"],
+                    "ref_price_confidence": feats["confidence"],
+                    "n_listings": feats["n_listings"],
+                    "price_percentile": feats["price_percentile"],
+                    "price_cv": feats["price_cv"],
+                    "sales_volume": sales_volume,
                 })
                 _redis_client.publish("cs2_listings", payload)
             return True
