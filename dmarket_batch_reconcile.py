@@ -234,7 +234,11 @@ async def reconcile_skin(session: aiohttp.ClientSession, market_hash_name: str) 
     return matches_found
 
 async def main():
-    logger.info("Démarrage de la réconciliation par lots (batch)...")
+    logger.error("❌ BATCH SCRIPT DÉSACTIVÉ — Utiliser reconcile_and_save() à la place")
+    logger.error("Motif : architecture consolidée vers single source of truth (reconcile_and_save)")
+    logger.error("Ce script était indépendant et créait des TX orphelines")
+    return
+    # logger.info("Démarrage de la réconciliation par lots (batch)...")
     
     # 0. Créer/vérifier les index pour les performances
     ensure_indexes()
