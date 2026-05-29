@@ -494,7 +494,7 @@ def get_ml_stats():
     }
 
 
-TRADING_DB_PATH = os.path.join(os.path.dirname(config.OBSERVER_DB_PATH), "..", "cs2-trading-bot", "data", "trading.db")
+TRADING_DB_PATH = os.getenv("TRADING_DB_PATH", "/home/ubuntu/cs2-trading-bot/data/trading.db")
 
 def get_trading_db_connection():
     """Connexion read-only à la DB du bot de trading."""
