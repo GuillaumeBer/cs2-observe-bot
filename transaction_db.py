@@ -1083,17 +1083,8 @@ class TransactionDatabase:
             # Optimisation : utiliser une window function (ROW_NUMBER) au lieu d'une sous-requête corrélée
             # pour éviter l'exécution répétée de MAX() pour chaque vente (~25K)
             rows = conn.execute("""
-                WITH ranked_listings AS (
+                WITH match_candidates AS (
                   SELECT
-                    l.*,
-                    ROW_NUMBER() OVER (
-                      PARTITION BY l.platform, l.market_hash_name, l.float_value
-                      ORDER BY l.original_listed_at DESC
-                    ) as listing_rank
-                  FROM observed_listings l
-                  WHERE l.original_listed_at IS NOT NULL
-                )
-                SELECT
                     s.id            AS sale_id,
                     l.listing_id,
                     l.market_hash_name,
@@ -1109,19 +1100,25 @@ class TransactionDatabase:
                     l.platform,
                     l.paint_seed,
                     l.sticker_count,
-                    l.sticker_names
-                FROM marketplace_sales s
-                JOIN ranked_listings l ON
+                    l.sticker_names,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY s.id
+                      ORDER BY l.original_listed_at DESC
+                    ) as listing_rank
+                  FROM marketplace_sales s
+                  JOIN observed_listings l ON
                     l.platform = s.platform
                     AND l.market_hash_name = s.market_hash_name
-                    AND l.float_value BETWEEN s.float_value - 0.0001 AND s.float_value + 0.0001
+                    AND ABS(l.float_value - s.float_value) <= 0.0001
                     AND l.original_listed_at < s.sale_ts
                     AND l.original_listed_at > s.sale_ts - ?
                     AND COALESCE(l.listed_at, l.original_listed_at) <= s.sale_ts
-                    AND l.listing_rank = 1
-                WHERE l.float_value IS NOT NULL
-                  AND s.reconciled_at IS NULL
-                ORDER BY s.id
+                  WHERE l.float_value IS NOT NULL
+                    AND s.reconciled_at IS NULL
+                )
+                SELECT * FROM match_candidates
+                WHERE listing_rank = 1
+                ORDER BY sale_id
             """, (max_window,)).fetchall()
 
             sale_ids_to_mark = []
