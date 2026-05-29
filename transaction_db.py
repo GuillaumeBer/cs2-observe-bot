@@ -9,6 +9,18 @@ import config
 
 logger = logging.getLogger("cs2_sniper.transaction_db")
 
+# Publication Redis optionnelle — si Redis n'est pas disponible, le bot continue normalement
+try:
+    import redis as _redis
+    _redis_client = _redis.Redis(host="localhost", port=6379, decode_responses=True)
+    _redis_client.ping()
+    _REDIS_AVAILABLE = True
+    logger.info("Redis connecté — publication des listings activée")
+except Exception:
+    _redis_client = None
+    _REDIS_AVAILABLE = False
+    logger.warning("Redis non disponible — publication des listings désactivée")
+
 
 class TransactionDatabase:
     """
@@ -636,6 +648,23 @@ class TransactionDatabase:
                         suggested_price_cents,
                     ),
                 )
+            # Publier sur Redis pour le bot de trading
+            if _REDIS_AVAILABLE:
+                ref_price, _ = self._compute_ref_price(market_hash_name)
+                payload = json.dumps({
+                    "listing_id": listing_id,
+                    "market_hash_name": market_hash_name,
+                    "price_usd": price_cents / 100.0,
+                    "float_value": float_value,
+                    "paint_seed": paint_seed,
+                    "sticker_count": sticker_count,
+                    "sticker_names": sticker_names or [],
+                    "platform": platform,
+                    "listed_at": listed_at,
+                    "suggested_price_cents": suggested_price_cents,
+                    "ref_price_usd": ref_price,
+                })
+                _redis_client.publish("cs2_listings", payload)
             return True
         except Exception as e:
             logger.error(f"Erreur d'enregistrement du listing observé {listing_id} : {e}")
