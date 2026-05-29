@@ -586,16 +586,18 @@ def get_signals(limit: int = Query(100, ge=1, le=500)):
         for sale in recent_sales:
             # Cherche si le bot a émis un signal pour ce skin dans la dernière heure
             # Matching par market_hash_name + platform (fiable car c'est l'ID du skin)
+            # Comparaison sur epoch (strftime) car detected_at est en ISO avec 'T'
+            # alors que datetime(unixepoch) utilise un espace → comparaison string KO
             signal = trading_conn.execute("""
                 SELECT decision, predicted_ttd_h, discount_pct
                 FROM signals
                 WHERE market_hash_name = ?
                   AND platform = ?
-                  AND detected_at BETWEEN datetime(?, 'unixepoch', '-3600 seconds') AND datetime(?, 'unixepoch')
+                  AND CAST(strftime('%s', detected_at) AS REAL) BETWEEN ? AND ?
                 ORDER BY detected_at DESC
                 LIMIT 1
             """, (sale["market_hash_name"], sale["platform"],
-                  sale["sale_ts"], sale["sale_ts"])).fetchone()
+                  sale["sale_ts"] - 3600, sale["sale_ts"])).fetchone()
 
             # TTD réel depuis transactions (vente réconciliée avec listing observé)
             tx = obs_conn.execute("""
