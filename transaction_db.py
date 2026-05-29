@@ -1101,10 +1101,12 @@ class TransactionDatabase:
                     l.paint_seed,
                     l.sticker_count,
                     l.sticker_names,
+                    ABS(l.float_value - s.float_value) as float_diff,
+                    ABS(l.price_cents - s.price_usd * 100) as price_diff_cents,
                     ROW_NUMBER() OVER (
                       PARTITION BY s.id
-                      ORDER BY l.original_listed_at DESC
-                    ) as listing_rank
+                      ORDER BY ABS(l.float_value - s.float_value) ASC, ABS(l.price_cents - s.price_usd * 100) ASC
+                    ) as match_rank
                   FROM marketplace_sales s
                   JOIN observed_listings l ON
                     l.platform = s.platform
@@ -1116,8 +1118,12 @@ class TransactionDatabase:
                   WHERE l.float_value IS NOT NULL
                     AND s.reconciled_at IS NULL
                 )
-                SELECT * FROM match_candidates
-                WHERE listing_rank = 1
+                SELECT
+                  sale_id, listing_id, market_hash_name, float_value, price_cents,
+                  price_usd, sale_ts, original_listed_at, listed_at, suggested_price_cents,
+                  effective_listed_at, ttd_ms, platform, paint_seed, sticker_count, sticker_names
+                FROM match_candidates
+                WHERE match_rank = 1
                 ORDER BY sale_id
             """, (max_window,)).fetchall()
 
