@@ -516,7 +516,7 @@ def get_signals(limit: int = Query(100, ge=1, le=500)):
     obs_conn = get_db_connection()
     try:
         rows = trading_conn.execute("""
-            SELECT detected_at, platform, listing_id, market_hash_name,
+            SELECT detected_at, listed_at, platform, listing_id, market_hash_name,
                    float_value, price_usd, ref_price_usd, discount_pct,
                    predicted_ttd_h, decision, sticker_count
             FROM signals
@@ -565,6 +565,10 @@ def get_signals(limit: int = Query(100, ge=1, le=500)):
                 "sticker_count": r["sticker_count"],
                 "confirmed_sale": confirmed_sale,
                 "confirmed_ttd_h": round(confirmed_ttd_h, 2) if confirmed_ttd_h else None,
+                "detection_delay_s": round(
+                    (dt.fromisoformat(r["detected_at"].replace("Z", "+00:00")).timestamp() - r["listed_at"])
+                    if r["listed_at"] else None
+                ) if r["listed_at"] else None,
             })
 
         # Ventes récentes (1h glissante) avec flag "détecté par le bot"
