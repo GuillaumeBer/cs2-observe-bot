@@ -282,7 +282,8 @@ class TransactionDatabase:
             if n < min_listings:
                 return {"ref_price": None, "confidence": None, "n_listings": n,
                         "price_percentile": 0.0, "price_cv": 0.0,
-                        "resell_discount_pct": 0.0, "resell_price_percentile": 0.0}
+                        "resell_discount_pct": 0.0, "resell_price_percentile": 0.0,
+                        "prices_sample": []}
 
             # P10 : le bas du marché (médian trop influencé par les listings stales/surcotés)
             p10 = prices[max(0, n // 10)]
@@ -291,6 +292,14 @@ class TransactionDatabase:
             # Percentile exact du prix de ce listing dans la distribution
             below = sum(1 for p in prices if p < price_usd)
             price_percentile = below / n * 100.0
+
+            # Échantillon de prix pour que le trading engine puisse optimiser le prix de revente
+            # Max 80 valeurs — espacement uniforme sur la distribution
+            if n <= 80:
+                prices_sample = prices
+            else:
+                step = n / 80
+                prices_sample = [prices[int(i * step)] for i in range(80)]
 
             # Coefficient de variation (dispersion) — détecte les marchés bimodaux
             mean_p = sum(prices) / n
@@ -306,13 +315,15 @@ class TransactionDatabase:
             return {"ref_price": p10, "confidence": confidence, "n_listings": n,
                     "price_percentile": round(price_percentile, 2), "price_cv": round(cv, 4),
                     "resell_discount_pct": round(resell_discount_pct, 2),
-                    "resell_price_percentile": round(resell_percentile, 2)}
+                    "resell_price_percentile": round(resell_percentile, 2),
+                    "prices_sample": [round(p, 2) for p in prices_sample]}
 
         except Exception as e:
             logger.error(f"Erreur _compute_listing_features pour {market_hash_name}: {e}")
             return {"ref_price": None, "confidence": None, "n_listings": 0,
                     "price_percentile": 0.0, "price_cv": 0.0,
-                    "resell_discount_pct": 0.0, "resell_price_percentile": 0.0}
+                    "resell_discount_pct": 0.0, "resell_price_percentile": 0.0,
+                    "prices_sample": []}
         finally:
             conn.close()
 
@@ -755,6 +766,7 @@ class TransactionDatabase:
                     "sales_volume": sales_volume,
                     "resell_discount_pct": feats["resell_discount_pct"],
                     "resell_price_percentile": feats["resell_price_percentile"],
+                    "prices_sample": feats["prices_sample"],
                 })
                 _redis_client.publish("cs2_listings", payload)
             return True

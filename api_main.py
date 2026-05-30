@@ -518,7 +518,9 @@ def get_signals(limit: int = Query(100, ge=1, le=500)):
         rows = trading_conn.execute("""
             SELECT detected_at, listed_at, platform, listing_id, market_hash_name,
                    float_value, price_usd, ref_price_usd, discount_pct,
-                   predicted_ttd_h, predicted_ttd_resell_h, decision, sticker_count
+                   predicted_ttd_h, predicted_ttd_resell_h,
+                   optimal_sell_price, expected_roi_per_hour, expected_profit_usd,
+                   decision, sticker_count
             FROM signals
             ORDER BY detected_at DESC
             LIMIT ?
@@ -560,8 +562,11 @@ def get_signals(limit: int = Query(100, ge=1, le=500)):
                 "price_usd": r["price_usd"],
                 "ref_price_usd": r["ref_price_usd"],
                 "discount_pct": round(r["discount_pct"] or 0, 1),
-                "predicted_ttd_h": round(r["predicted_ttd_h"], 2) if r["predicted_ttd_h"] else None,
+                "predicted_ttd_h":        round(r["predicted_ttd_h"], 2) if r["predicted_ttd_h"] else None,
                 "predicted_ttd_resell_h": round(r["predicted_ttd_resell_h"], 2) if r["predicted_ttd_resell_h"] else None,
+                "optimal_sell_price":     round(r["optimal_sell_price"], 2) if r["optimal_sell_price"] else None,
+                "expected_roi_per_hour":  round(r["expected_roi_per_hour"], 2) if r["expected_roi_per_hour"] else None,
+                "expected_profit_usd":    round(r["expected_profit_usd"], 2) if r["expected_profit_usd"] else None,
                 "decision": r["decision"],
                 "sticker_count": r["sticker_count"],
                 "confirmed_sale": confirmed_sale,
