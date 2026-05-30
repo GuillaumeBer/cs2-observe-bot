@@ -507,15 +507,18 @@ def get_trading_db_connection():
 
 
 @app.get("/api/signals")
-def get_signals(limit: int = Query(100, ge=1, le=500)):
+def get_signals(limit: int = Query(100, ge=1, le=500), decision: str = Query(None)):
     """Signaux GO/WATCH détectés par le bot de trading.
-    Pour chaque signal GO, vérifie si une vente a eu lieu dans l'heure suivante."""
+    Pour chaque signal GO, vérifie si une vente a eu lieu dans l'heure suivante.
+    `decision` (GO/WATCH) filtre côté serveur — sinon les GO rares sont noyés sous les WATCH."""
     trading_conn = get_trading_db_connection()
     if trading_conn is None:
         return {"signals": [], "error": "Trading bot DB not found"}
     obs_conn = get_db_connection()
+    decision_filter = "WHERE decision = ?" if decision in ("GO", "WATCH") else ""
+    params = ([decision, limit] if decision in ("GO", "WATCH") else [limit])
     try:
-        rows = trading_conn.execute("""
+        rows = trading_conn.execute(f"""
             SELECT detected_at, listed_at, platform, listing_id, market_hash_name,
                    float_value, price_usd, ref_price_usd, discount_pct,
                    predicted_ttd_h, predicted_ttd_resell_h,
@@ -523,9 +526,10 @@ def get_signals(limit: int = Query(100, ge=1, le=500)):
                    expected_p_sell, expected_ev_usd,
                    decision, sticker_count
             FROM signals
+            {decision_filter}
             ORDER BY detected_at DESC
             LIMIT ?
-        """, (limit,)).fetchall()
+        """, params).fetchall()
 
         signals = []
         for r in rows:
