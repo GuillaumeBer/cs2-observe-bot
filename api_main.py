@@ -523,7 +523,7 @@ def get_signals(limit: int = Query(100, ge=1, le=500), decision: str = Query(Non
                    float_value, price_usd, ref_price_usd, discount_pct,
                    predicted_ttd_h, predicted_ttd_resell_h,
                    optimal_sell_price, expected_roi_per_hour, expected_profit_usd,
-                   expected_p_sell, expected_ev_usd,
+                   expected_p_sell, expected_ev_usd, breakeven_p_sell,
                    decision, sticker_count
             FROM signals
             {decision_filter}
@@ -574,6 +574,7 @@ def get_signals(limit: int = Query(100, ge=1, le=500), decision: str = Query(Non
                 "expected_profit_usd":    round(r["expected_profit_usd"], 2) if r["expected_profit_usd"] else None,
                 "expected_p_sell":        round(r["expected_p_sell"], 4) if r["expected_p_sell"] else None,
                 "expected_ev_usd":        round(r["expected_ev_usd"], 2) if r["expected_ev_usd"] else None,
+                "breakeven_p_sell":       round(r["breakeven_p_sell"], 4) if r["breakeven_p_sell"] else None,
                 "decision": r["decision"],
                 "sticker_count": r["sticker_count"],
                 "confirmed_sale": confirmed_sale,
