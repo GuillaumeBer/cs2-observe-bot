@@ -638,6 +638,124 @@ def get_signals(limit: int = Query(100, ge=1, le=500)):
         obs_conn.close()
 
 
+@app.get("/api/backtest")
+def run_backtest(
+    min_discount: float = Query(20.0, description="Décote minimum %"),
+    max_ttd_resell: float = Query(3.0, description="TTD revente max (h)"),
+    min_sales_vol: int = Query(5, description="Volume ventes min"),
+):
+    """Backtest du modèle sur les transactions historiques."""
+    import numpy as np
+    import onnxruntime as ort
+    from datetime import datetime as dt_class
+
+    obs_conn = get_db_connection()
+    try:
+        model_path = config.TRADING_MODEL_PATH if hasattr(config, 'TRADING_MODEL_PATH') else "/home/ubuntu/cs2-trading-bot/model/ttd_predictor.onnx"
+        try:
+            session = ort.InferenceSession(model_path)
+        except Exception as e:
+            return {"error": f"Modèle non disponible: {e}"}
+
+        def predict_ttd(feats):
+            X = np.array([[
+                feats.get('price_usd',0), feats.get('float_value',0),
+                feats.get('sticker_count',0), feats.get('discount_pct',0),
+                feats.get('n_listings',0), feats.get('is_knife',0),
+                feats.get('is_gloves',0), feats.get('is_stattrak',0),
+                feats.get('is_souvenir',0), feats.get('wear_fn',0),
+                feats.get('wear_mw',0), feats.get('wear_ft',0),
+                feats.get('wear_ww',0), feats.get('wear_bs',0),
+                feats.get('price_percentile',0), feats.get('price_cv',0),
+                feats.get('sales_volume',0), feats.get('hour_of_day',0),
+                feats.get('day_of_week',0),
+            ]], dtype=np.float32)
+            out = session.run(None, {'input': X})
+            return float(np.expm1(out[0].flat[0]))
+
+        # Pré-calculs
+        vol_map = {(r[0], r[1]): r[2] for r in obs_conn.execute(
+            "SELECT market_hash_name, platform, COUNT(*) FROM marketplace_sales GROUP BY market_hash_name, platform"
+        ).fetchall()}
+
+        listings_cache = {}
+        for r in obs_conn.execute("SELECT market_hash_name, platform, price_cents FROM observed_listings ORDER BY market_hash_name, platform, price_cents ASC").fetchall():
+            listings_cache.setdefault((r[0], r[1]), []).append(r[2] / 100.0)
+
+        transactions = obs_conn.execute("""
+            SELECT market_hash_name, price_usd, float_value, sticker_count, ttd_ms, platform, timestamp
+            FROM transactions WHERE ttd_ms IS NOT NULL AND float_value IS NOT NULL
+        """).fetchall()
+
+        go_correct, go_incorrect, watch_missed, watch_ok = [], [], [], []
+
+        for tx in transactions:
+            name, price, platform = tx[0], tx[1], tx[5]
+            real_ttd_h = tx[4] / 3600000.0
+            prices = listings_cache.get((name, platform), [])
+            n = len(prices)
+            if n < 5: continue
+            p10 = prices[max(0, n//10)]
+            discount = (p10 - price) / p10 * 100 if p10 > 0 else 0
+            if discount < min_discount: continue
+            vol = vol_map.get((name, platform), 0)
+            if vol < min_sales_vol: continue
+
+            mean_p = sum(prices)/n
+            var = sum((p-mean_p)**2 for p in prices)/n
+            cv = (var**0.5)/mean_p if mean_p > 0 else 0.0
+            pct = sum(1 for p in prices if p < price)/n*100
+            wear = tx[2]
+            try:
+                d = dt_class.fromisoformat(tx[6]); hour, dow = d.hour, d.weekday()
+            except: hour, dow = 12, 0
+
+            feats_resell = {
+                'price_usd': price*1.10, 'float_value': wear,
+                'sticker_count': tx[3], 'n_listings': n,
+                'discount_pct': (p10-price*1.10)/p10*100 if p10>0 else 0,
+                'is_knife': 1 if '★' in name and not any(k in name for k in ['Gloves','Wraps','Moto','Driver','Sport','Hand','Specialist']) else 0,
+                'is_gloves': 1 if any(k in name for k in ['Gloves','Wraps','Moto','Driver','Sport','Hand','Specialist']) else 0,
+                'is_stattrak': 1 if 'StatTrak' in name else 0, 'is_souvenir': 1 if 'Souvenir' in name else 0,
+                'wear_fn': 1 if wear<0.07 else 0, 'wear_mw': 1 if 0.07<=wear<0.15 else 0,
+                'wear_ft': 1 if 0.15<=wear<0.38 else 0, 'wear_ww': 1 if 0.38<=wear<0.45 else 0, 'wear_bs': 1 if wear>=0.45 else 0,
+                'price_percentile': sum(1 for p in prices if p < price*1.10)/n*100,
+                'price_cv': cv, 'sales_volume': vol, 'hour_of_day': hour, 'day_of_week': dow,
+            }
+            ttd_resell = predict_ttd(feats_resell)
+            decision = 'GO' if ttd_resell < max_ttd_resell else 'WATCH'
+            entry = {'name': name, 'price': round(price,2), 'discount': round(discount,1),
+                     'real_ttd_h': round(real_ttd_h,2), 'ttd_resell_pred': round(ttd_resell,2),
+                     'vol': vol, 'platform': platform}
+            if decision == 'GO':
+                (go_correct if real_ttd_h < 24.0 else go_incorrect).append(entry)
+            else:
+                (watch_missed if real_ttd_h < max_ttd_resell else watch_ok).append(entry)
+
+        total = len(go_correct)+len(go_incorrect)+len(watch_missed)+len(watch_ok)
+        go_total = len(go_correct)+len(go_incorrect)
+        precision = len(go_correct)/go_total*100 if go_total else 0
+        recall = len(go_correct)/(len(go_correct)+len(watch_missed))*100 if (len(go_correct)+len(watch_missed)) else 0
+        avg_real = sum(e['real_ttd_h'] for e in go_correct)/len(go_correct) if go_correct else 0
+        avg_pred = sum(e['ttd_resell_pred'] for e in go_correct)/len(go_correct) if go_correct else 0
+
+        return {
+            "params": {"min_discount": min_discount, "max_ttd_resell": max_ttd_resell, "min_sales_vol": min_sales_vol},
+            "summary": {
+                "total_filtered": total, "go_total": go_total,
+                "go_correct": len(go_correct), "go_incorrect": len(go_incorrect),
+                "watch_missed": len(watch_missed), "watch_ok": len(watch_ok),
+                "precision_pct": round(precision, 1), "recall_pct": round(recall, 1),
+                "avg_real_ttd_h": round(avg_real, 2), "avg_pred_ttd_h": round(avg_pred, 2),
+            },
+            "go_correct":   sorted(go_correct,   key=lambda x: x['real_ttd_h'])[:50],
+            "go_incorrect": sorted(go_incorrect,  key=lambda x: -x['real_ttd_h'])[:20],
+            "watch_missed": sorted(watch_missed,  key=lambda x: x['real_ttd_h'])[:20],
+        }
+    finally:
+        obs_conn.close()
+
+
 if __name__ == "__main__":
     # Démarrage sur le port 8000 sur toutes les interfaces réseau (0.0.0.0)
     uvicorn.run("api_main:app", host="0.0.0.0", port=8000, reload=False)
